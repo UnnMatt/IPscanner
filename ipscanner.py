@@ -476,6 +476,60 @@ RESIDENTIAL_HINTS = {
     "wireless": -1,
 }
 
+OPTIONAL_ENRICHMENTS = [
+    {
+        "key": "type_summary",
+        "label": "Type summary",
+        "description": "Classification rollup by unique IPs and total hits.",
+    },
+    {
+        "key": "duplicates",
+        "label": "Duplicate summary",
+        "description": "Repeated IP counts so reuse stands out quickly.",
+    },
+    {
+        "key": "country_grouping",
+        "label": "Country grouping",
+        "description": "Country buckets for quick location review.",
+    },
+    {
+        "key": "asn_summary",
+        "label": "ASN summary",
+        "description": "Top networks by unique IP count and total hits.",
+    },
+    {
+        "key": "subnet_summary",
+        "label": "Subnet summary",
+        "description": "Top /24 ranges by unique IP count and total hits.",
+    },
+    {
+        "key": "detailed_results",
+        "label": "Detailed results",
+        "description": "Expanded per-IP geolocation and provider view.",
+    },
+]
+
+SCAN_PROFILES = {
+    "quick": {
+        "name": "Quick scan",
+        "description": "Fastest view with the core results plus the most useful rollups.",
+        "enabled": {"type_summary", "duplicates"},
+        "prompt_for_details": False,
+    },
+    "standard": {
+        "name": "Standard scan",
+        "description": "Recommended default with the best balance of speed and enrichment.",
+        "enabled": {"type_summary", "duplicates", "country_grouping", "asn_summary", "subnet_summary"},
+        "prompt_for_details": True,
+    },
+    "deep": {
+        "name": "Deep scan",
+        "description": "Full review mode with every summary and detailed per-IP output enabled.",
+        "enabled": {item["key"] for item in OPTIONAL_ENRICHMENTS},
+        "prompt_for_details": False,
+    },
+}
+
 
 def suspicion_color(label):
     if label == "VERY HIGH":
@@ -1206,7 +1260,7 @@ def read_from_paste():
 
 
 def choose_input():
-    print_step(1, 4, "Choose input source", "Paste directly or load a text file containing IPv4 addresses.")
+    print_step(1, 5, "Choose input source", "Paste directly or load a text file containing IPv4 addresses.")
 
     while True:
         print_box(
@@ -1238,6 +1292,113 @@ def choose_input():
             continue
         if choice == "3":
             sys.exit(0)
+        print(color("Invalid choice.", WARNING))
+
+
+def enabled_enrichment_labels(profile):
+    labels = []
+    for item in OPTIONAL_ENRICHMENTS:
+        if item["key"] in profile.get("enabled", set()):
+            labels.append(item["label"])
+    return labels
+
+
+def print_scan_profile_summary(profile):
+    enabled_labels = enabled_enrichment_labels(profile)
+    lines = [
+        f"{color('Profile', DIM + MUTED)} : {color(profile['name'], BOLD + ACCENT)}",
+        f"{color('Mode', DIM + MUTED)} : {profile['description']}",
+    ]
+
+    if enabled_labels:
+        wrapped = textwrap.wrap(", ".join(enabled_labels), width=max(28, min(terminal_width(), 92) - 20)) or [""]
+        lines.append(f"{color('Extras', DIM + MUTED)} : {wrapped[0]}")
+        for part in wrapped[1:]:
+            lines.append((" " * 11) + part)
+    else:
+        lines.append(f"{color('Extras', DIM + MUTED)} : None")
+
+    if profile.get("prompt_for_details"):
+        lines.append(f"{color('Details', DIM + MUTED)} : Ask before showing detailed results")
+    elif "detailed_results" in profile.get("enabled", set()):
+        lines.append(f"{color('Details', DIM + MUTED)} : Show detailed results automatically")
+    else:
+        lines.append(f"{color('Details', DIM + MUTED)} : Skip detailed results")
+
+    print_box("Scan Profile", lines, tone=ACCENT, width=min(terminal_width(), 92))
+
+
+def build_custom_scan_profile():
+    print_box(
+        "Custom Options",
+        [
+            "Toggle optional enrichments one by one.",
+            "Defaults follow Standard scan so you can trim or expand from there.",
+        ],
+        tone=ACCENT,
+        width=min(terminal_width(), 84),
+    )
+
+    defaults = SCAN_PROFILES["standard"]["enabled"]
+    enabled = set()
+
+    for item in OPTIONAL_ENRICHMENTS:
+        default = "y" if item["key"] in defaults else "n"
+        question = f"Enable {item['label'].lower()}? {item['description']}"
+        if ask_yes_no(question, default=default):
+            enabled.add(item["key"])
+
+    return {
+        "name": "Custom options",
+        "description": "Manual enrichment selection for this run.",
+        "enabled": enabled,
+        "prompt_for_details": False,
+    }
+
+
+def choose_scan_profile():
+    print_step(3, 5, "Choose scan profile", "Standard scan is the recommended default.")
+
+    while True:
+        print_box(
+            "Scan Profiles",
+            [
+                f"{color('1', BOLD + ACCENT)}  Quick scan     Fastest core view with a few high-value summaries",
+                f"{color('2', BOLD + ACCENT)}  Standard scan  Recommended default balance of speed and enrichment",
+                f"{color('3', BOLD + ACCENT)}  Deep scan      All summaries plus full detailed results",
+                f"{color('4', BOLD + ACCENT)}  Custom options Choose optional enrichments manually",
+                f"{color('5', BOLD + ACCENT)}  Exit",
+            ],
+            tone=PRIMARY,
+            width=min(terminal_width(), 92),
+        )
+
+        choice = prompt("Choose a profile [1-5, Enter=2]: ")
+        if not choice:
+            choice = "2"
+
+        if choice == "1":
+            profile = dict(SCAN_PROFILES["quick"])
+            profile["enabled"] = set(profile["enabled"])
+            print_scan_profile_summary(profile)
+            return profile
+        if choice == "2":
+            profile = dict(SCAN_PROFILES["standard"])
+            profile["enabled"] = set(profile["enabled"])
+            print_scan_profile_summary(profile)
+            return profile
+        if choice == "3":
+            profile = dict(SCAN_PROFILES["deep"])
+            profile["enabled"] = set(profile["enabled"])
+            print_scan_profile_summary(profile)
+            return profile
+        if choice == "4":
+            profile = build_custom_scan_profile()
+            print_scan_profile_summary(profile)
+            return profile
+        if choice == "5":
+            sys.exit(0)
+
         print(color("Invalid choice.", WARNING))
 
 
@@ -1279,28 +1440,42 @@ def main():
                 print_invalid(invalid_ips)
             return
 
-        print_step(2, 4, "Parse and validate input", "Reviewing deduplicated entries before lookup.")
+        print_step(2, 5, "Parse and validate input", "Reviewing deduplicated entries before lookup.")
         print_input_summary(valid_ips, invalid_ips, counts)
 
+        profile = choose_scan_profile()
+
         print_step(
-            3,
             4,
+            5,
             "Run geolocation lookup",
-            f"Submitting {len(valid_ips)} unique IP{'s' if len(valid_ips) != 1 else ''} to the batch API.",
+            (
+                f"Using {profile['name']}. "
+                f"Submitting {len(valid_ips)} unique IP{'s' if len(valid_ips) != 1 else ''} to the batch API."
+            ),
         )
         results = run_with_spinner("Looking up IPs...", lookup_ips, valid_ips)
         results = sort_results(results, counts)
 
-        print_step(4, 4, "Review results and export", "Summaries come first, then optional detail and export prompts.")
+        print_step(5, 5, "Review results and export", "Core results come first, then profile-driven enrichments and exports.")
         print_result_overview(results, counts)
         print_results_table(results, counts)
-        print_type_summary(results, counts)
-        print_duplicates(counts)
-        print_country_grouping(results, counts)
-        print_asn_summary(results, counts)
-        print_subnet_summary(results, counts)
 
-        if ask_yes_no("Show detailed results too?", default="n"):
+        if "type_summary" in profile["enabled"]:
+            print_type_summary(results, counts)
+        if "duplicates" in profile["enabled"]:
+            print_duplicates(counts)
+        if "country_grouping" in profile["enabled"]:
+            print_country_grouping(results, counts)
+        if "asn_summary" in profile["enabled"]:
+            print_asn_summary(results, counts)
+        if "subnet_summary" in profile["enabled"]:
+            print_subnet_summary(results, counts)
+
+        if profile.get("prompt_for_details"):
+            if ask_yes_no("Show detailed results too?", default="n"):
+                print_detailed_results(results, counts)
+        elif "detailed_results" in profile["enabled"]:
             print_detailed_results(results, counts)
 
         print_invalid(invalid_ips)
