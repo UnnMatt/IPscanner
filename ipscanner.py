@@ -11,12 +11,18 @@ import textwrap
 import urllib.request
 import urllib.error
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
 
 API_URL = "http://ip-api.com/batch"
 FIELDS = (
     "status,message,query,country,countryCode,regionName,city,zip,lat,lon,timezone,"
     "isp,org,as,asname,hosting,proxy,mobile"
 )
+
+# ==================================================
+# Theme And Display Constants
+# ==================================================
 
 # ANSI colors
 RESET = "[0m"
@@ -39,6 +45,11 @@ DANGER = RED
 MUTED = GRAY
 
 ANSI_RE = re.compile(r"\[[0-9;]*m")
+
+
+# ==================================================
+# UI Helpers
+# ==================================================
 
 
 def color(text, c):
@@ -286,6 +297,136 @@ def run_with_spinner(message, func, *args, **kwargs):
     return state["result"]
 
 
+# ==================================================
+# Internal Data Models And Workflow Hooks
+# ==================================================
+
+
+@dataclass
+class InputParseResult:
+    valid_ips: list
+    invalid_ips: list
+    counts: Counter
+
+
+@dataclass
+class EnrichmentOption:
+    key: str
+    label: str
+    description: str
+
+
+@dataclass
+class ScanProfile:
+    key: str
+    name: str
+    description: str
+    enabled: set = field(default_factory=set)
+    prompt_for_details: bool = False
+
+    def runtime_copy(self):
+        return ScanProfile(
+            key=self.key,
+            name=self.name,
+            description=self.description,
+            enabled=set(self.enabled),
+            prompt_for_details=self.prompt_for_details,
+        )
+
+    def is_enabled(self, enrichment_key):
+        return enrichment_key in self.enabled
+
+
+@dataclass(frozen=True)
+class WorkflowPreset:
+    key: str
+    name: str
+    description: str
+    default_profile_key: str
+    step_total: int = 5
+
+
+@dataclass
+class IPResultRecord:
+    query: str = ""
+    count: int = 1
+    status: str = ""
+    message: str = ""
+    country: str = ""
+    countryCode: str = ""
+    regionName: str = ""
+    city: str = ""
+    zip: str = ""
+    lat: object = ""
+    lon: object = ""
+    timezone: str = ""
+    isp: str = ""
+    org: str = ""
+    asn: str = ""
+    asname: str = ""
+    hosting: Optional[bool] = None
+    proxy: Optional[bool] = None
+    mobile: Optional[bool] = None
+    provider_text: str = ""
+    suspicion_flag: str = "N/A"
+    suspicion_score: Optional[int] = None
+    reasons: list = field(default_factory=list)
+    ip_type: str = ""
+    raw: dict = field(default_factory=dict)
+
+    def get(self, key, default=None):
+        aliases = {
+            "as": self.asn,
+            "type": self.ip_type,
+            "suspicion_flag": self.suspicion_flag,
+            "suspicion_score": self.suspicion_score,
+            "reasons": self.reasons,
+            "count": self.count,
+        }
+        if key in aliases:
+            value = aliases[key]
+            return default if value is None else value
+        if key in self.__dict__:
+            value = getattr(self, key)
+            return default if value is None else value
+        if key in self.raw:
+            value = self.raw[key]
+            return default if value is None else value
+        return default
+
+    def to_export_dict(self):
+        return {
+            "status": self.status,
+            "message": self.message,
+            "query": self.query,
+            "country": self.country,
+            "countryCode": self.countryCode,
+            "regionName": self.regionName,
+            "city": self.city,
+            "zip": self.zip,
+            "lat": self.lat,
+            "lon": self.lon,
+            "timezone": self.timezone,
+            "isp": self.isp,
+            "org": self.org,
+            "as": self.asn,
+            "asname": self.asname,
+            "hosting": self.hosting,
+            "proxy": self.proxy,
+            "mobile": self.mobile,
+            "count": self.count,
+            "type": self.ip_type,
+            "suspicion_flag": self.suspicion_flag,
+            "suspicion_score": self.suspicion_score,
+            "reasons": list(self.reasons),
+        }
+
+
+# ==================================================
+# Scoring Keywords And Built-In Profiles
+# ==================================================
+
+
 # Strong indicators
 HARD_KEYWORDS = {
     "vpn": 4,
@@ -477,58 +618,80 @@ RESIDENTIAL_HINTS = {
 }
 
 OPTIONAL_ENRICHMENTS = [
-    {
-        "key": "type_summary",
-        "label": "Type summary",
-        "description": "Classification rollup by unique IPs and total hits.",
-    },
-    {
-        "key": "duplicates",
-        "label": "Duplicate summary",
-        "description": "Repeated IP counts so reuse stands out quickly.",
-    },
-    {
-        "key": "country_grouping",
-        "label": "Country grouping",
-        "description": "Country buckets for quick location review.",
-    },
-    {
-        "key": "asn_summary",
-        "label": "ASN summary",
-        "description": "Top networks by unique IP count and total hits.",
-    },
-    {
-        "key": "subnet_summary",
-        "label": "Subnet summary",
-        "description": "Top /24 ranges by unique IP count and total hits.",
-    },
-    {
-        "key": "detailed_results",
-        "label": "Detailed results",
-        "description": "Expanded per-IP geolocation and provider view.",
-    },
+    EnrichmentOption(
+        key="type_summary",
+        label="Type summary",
+        description="Classification rollup by unique IPs and total hits.",
+    ),
+    EnrichmentOption(
+        key="duplicates",
+        label="Duplicate summary",
+        description="Repeated IP counts so reuse stands out quickly.",
+    ),
+    EnrichmentOption(
+        key="country_grouping",
+        label="Country grouping",
+        description="Country buckets for quick location review.",
+    ),
+    EnrichmentOption(
+        key="asn_summary",
+        label="ASN summary",
+        description="Top networks by unique IP count and total hits.",
+    ),
+    EnrichmentOption(
+        key="subnet_summary",
+        label="Subnet summary",
+        description="Top /24 ranges by unique IP count and total hits.",
+    ),
+    EnrichmentOption(
+        key="detailed_results",
+        label="Detailed results",
+        description="Expanded per-IP geolocation and provider view.",
+    ),
 ]
 
 SCAN_PROFILES = {
-    "quick": {
-        "name": "Quick scan",
-        "description": "Fastest view with the core results plus the most useful rollups.",
-        "enabled": {"type_summary", "duplicates"},
-        "prompt_for_details": False,
-    },
-    "standard": {
-        "name": "Standard scan",
-        "description": "Recommended default with the best balance of speed and enrichment.",
-        "enabled": {"type_summary", "duplicates", "country_grouping", "asn_summary", "subnet_summary"},
-        "prompt_for_details": True,
-    },
-    "deep": {
-        "name": "Deep scan",
-        "description": "Full review mode with every summary and detailed per-IP output enabled.",
-        "enabled": {item["key"] for item in OPTIONAL_ENRICHMENTS},
-        "prompt_for_details": False,
-    },
+    "quick": ScanProfile(
+        key="quick",
+        name="Quick scan",
+        description="Fastest view with the core results plus the most useful rollups.",
+        enabled={"type_summary", "duplicates"},
+        prompt_for_details=False,
+    ),
+    "standard": ScanProfile(
+        key="standard",
+        name="Standard scan",
+        description="Recommended default with the best balance of speed and enrichment.",
+        enabled={"type_summary", "duplicates", "country_grouping", "asn_summary", "subnet_summary"},
+        prompt_for_details=True,
+    ),
+    "deep": ScanProfile(
+        key="deep",
+        name="Deep scan",
+        description="Full review mode with every summary and detailed per-IP output enabled.",
+        enabled={item.key for item in OPTIONAL_ENRICHMENTS},
+        prompt_for_details=False,
+    ),
 }
+
+DEFAULT_WORKFLOW_PRESET_KEY = "classic"
+WORKFLOW_PRESETS = {
+    DEFAULT_WORKFLOW_PRESET_KEY: WorkflowPreset(
+        key=DEFAULT_WORKFLOW_PRESET_KEY,
+        name="Classic terminal flow",
+        description="The current familiar prompt -> lookup -> review -> export workflow.",
+        default_profile_key="standard",
+        step_total=5,
+    ),
+}
+
+
+def get_scan_profile(profile_key):
+    return SCAN_PROFILES[profile_key].runtime_copy()
+
+
+def get_workflow_preset(preset_key=DEFAULT_WORKFLOW_PRESET_KEY):
+    return WORKFLOW_PRESETS[preset_key]
 
 
 def suspicion_color(label):
@@ -543,6 +706,11 @@ def suspicion_color(label):
     return GREEN
 
 
+# ==================================================
+# Input Parsing
+# ==================================================
+
+
 def is_valid_ipv4(ip):
     pattern = re.compile(
         r"^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\."
@@ -553,7 +721,7 @@ def is_valid_ipv4(ip):
     return bool(pattern.match(ip))
 
 
-def extract_ips(text):
+def parse_input_text(text):
     raw_items = re.split(r"[\s,;]+", text.strip())
     raw_items = [item.strip() for item in raw_items if item.strip()]
 
@@ -570,12 +738,26 @@ def extract_ips(text):
     unique_valid = list(dict.fromkeys(valid))
     invalid_unique = list(dict.fromkeys(invalid))
 
-    return unique_valid, invalid_unique, counts
+    return InputParseResult(
+        valid_ips=unique_valid,
+        invalid_ips=invalid_unique,
+        counts=counts,
+    )
+
+
+def extract_ips(text):
+    parsed = parse_input_text(text)
+    return parsed.valid_ips, parsed.invalid_ips, parsed.counts
 
 
 def chunk_list(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+# ==================================================
+# Lookup Logic
+# ==================================================
 
 
 def lookup_batch(ips):
@@ -600,6 +782,11 @@ def lookup_ips(ips):
     return all_results
 
 
+# ==================================================
+# Scoring, Classification, And Record Hydration
+# ==================================================
+
+
 def collect_provider_text(item):
     parts = [
         item.get("isp", ""),
@@ -622,7 +809,7 @@ def keyword_hits(text, mapping):
     return score, hits
 
 
-def suspicion_score(item):
+def compute_suspicion_score(item):
     score = 0
     reasons = []
 
@@ -693,9 +880,7 @@ def suspicion_score(item):
     return label, reasons, score
 
 
-def likely_type(item):
-    flag, _, score = suspicion_score(item)
-
+def classify_ip_type(item, flag, score):
     if item.get("mobile") is True and item.get("hosting") is not True and item.get("proxy") is not True:
         return "Likely Mobile"
 
@@ -709,6 +894,69 @@ def likely_type(item):
         return "Manual Review"
 
     return "Low Suspicion"
+
+
+def suspicion_score(item):
+    if isinstance(item, IPResultRecord) and item.suspicion_score is not None:
+        return item.suspicion_flag, list(item.reasons), item.suspicion_score
+    return compute_suspicion_score(item)
+
+
+def likely_type(item):
+    if isinstance(item, IPResultRecord) and item.ip_type:
+        return item.ip_type
+    flag, _, score = suspicion_score(item)
+    return classify_ip_type(item, flag, score)
+
+
+def build_result_record(item, counts):
+    query = item.get("query", "")
+    record = IPResultRecord(
+        query=query,
+        count=counts.get(query, 1),
+        status=item.get("status", ""),
+        message=item.get("message", ""),
+        country=item.get("country", ""),
+        countryCode=item.get("countryCode", ""),
+        regionName=item.get("regionName", ""),
+        city=item.get("city", ""),
+        zip=item.get("zip", ""),
+        lat=item.get("lat", ""),
+        lon=item.get("lon", ""),
+        timezone=item.get("timezone", ""),
+        isp=item.get("isp", ""),
+        org=item.get("org", ""),
+        asn=item.get("as", ""),
+        asname=item.get("asname", ""),
+        hosting=item.get("hosting"),
+        proxy=item.get("proxy"),
+        mobile=item.get("mobile"),
+        raw=dict(item),
+    )
+    record.provider_text = collect_provider_text(record)
+
+    if record.status == "success":
+        flag, reasons, score = compute_suspicion_score(record)
+        record.suspicion_flag = flag
+        record.reasons = reasons
+        record.suspicion_score = score
+        record.ip_type = classify_ip_type(record, flag, score)
+    else:
+        record.suspicion_flag = "N/A"
+        record.reasons = []
+        record.suspicion_score = None
+        record.ip_type = "Lookup Failed"
+
+    return record
+
+
+def hydrate_result_records(raw_results, counts):
+    return [build_result_record(item, counts) for item in raw_results]
+
+
+# ==================================================
+# Formatting Helpers
+# ==================================================
 
 
 def safe(value, max_len=None):
@@ -778,6 +1026,11 @@ def type_tone(ip_type):
         "Lookup Failed": DANGER,
     }
     return mapping.get(ip_type, ACCENT)
+
+
+# ==================================================
+# Rendering
+# ==================================================
 
 
 def print_input_summary(valid_ips, invalid_ips, counts):
@@ -1119,6 +1372,44 @@ def print_subnet_summary(results, counts, limit=10):
         print(color(f"Showing top {limit} of {len(ranked)} subnets.", DIM + MUTED))
 
 
+# ==================================================
+# Enrichment Routing
+# ==================================================
+
+
+ENRICHMENT_RENDERERS = {
+    "type_summary": print_type_summary,
+    "duplicates": lambda results, counts: print_duplicates(counts),
+    "country_grouping": print_country_grouping,
+    "asn_summary": print_asn_summary,
+    "subnet_summary": print_subnet_summary,
+    "detailed_results": print_detailed_results,
+}
+
+
+def render_enabled_enrichments(results, counts, profile):
+    for option in OPTIONAL_ENRICHMENTS:
+        if option.key == "detailed_results":
+            continue
+        if profile.is_enabled(option.key):
+            renderer = ENRICHMENT_RENDERERS.get(option.key)
+            if renderer:
+                renderer(results, counts)
+
+
+def render_detailed_results_if_enabled(results, counts, profile):
+    if profile.prompt_for_details:
+        if ask_yes_no("Show detailed results too?", default="n"):
+            print_detailed_results(results, counts)
+    elif profile.is_enabled("detailed_results"):
+        print_detailed_results(results, counts)
+
+
+# ==================================================
+# Export
+# ==================================================
+
+
 def save_to_csv(results, counts, filename="ip_results.csv"):
     with open(filename, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
@@ -1162,7 +1453,7 @@ def save_to_csv(results, counts, filename="ip_results.csv"):
 
             writer.writerow([
                 ip,
-                counts.get(ip, 1),
+                item.get("count", counts.get(ip, 1)),
                 item.get("status", ""),
                 item.get("country", ""),
                 item.get("countryCode", ""),
@@ -1191,26 +1482,50 @@ def save_to_json(results, counts, filename="ip_results.json"):
     output = []
 
     for item in results:
-        ip = item.get("query", "")
-        enriched = dict(item)
-        enriched["count"] = counts.get(ip, 1)
-
-        if item.get("status") == "success":
-            flag, reasons, score = suspicion_score(item)
-            enriched["type"] = likely_type(item)
-            enriched["suspicion_flag"] = flag
-            enriched["suspicion_score"] = score
-            enriched["reasons"] = reasons
+        if isinstance(item, IPResultRecord):
+            enriched = item.to_export_dict()
         else:
-            enriched["type"] = "Lookup Failed"
-            enriched["suspicion_flag"] = "N/A"
-            enriched["suspicion_score"] = None
-            enriched["reasons"] = []
+            ip = item.get("query", "")
+            enriched = dict(item)
+            enriched["count"] = counts.get(ip, 1)
+
+            if item.get("status") == "success":
+                flag, reasons, score = suspicion_score(item)
+                enriched["type"] = likely_type(item)
+                enriched["suspicion_flag"] = flag
+                enriched["suspicion_score"] = score
+                enriched["reasons"] = reasons
+            else:
+                enriched["type"] = "Lookup Failed"
+                enriched["suspicion_flag"] = "N/A"
+                enriched["suspicion_score"] = None
+                enriched["reasons"] = []
 
         output.append(enriched)
 
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
+
+
+def run_export_flow(results, counts):
+    if ask_yes_no("Save results to CSV?", default="n"):
+        filename = prompt("Enter filename [ip_results.csv]: ")
+        if not filename:
+            filename = "ip_results.csv"
+        save_to_csv(results, counts, filename)
+        print(color(f"Saved CSV to {filename}", SUCCESS))
+
+    if ask_yes_no("Save results to JSON too?", default="n"):
+        filename = prompt("Enter filename [ip_results.json]: ")
+        if not filename:
+            filename = "ip_results.json"
+        save_to_json(results, counts, filename)
+        print(color(f"Saved JSON to {filename}", SUCCESS))
+
+
+# ==================================================
+# Input Sources
+# ==================================================
 
 
 def read_from_file(path):
@@ -1259,8 +1574,8 @@ def read_from_paste():
     return "\n".join(lines)
 
 
-def choose_input():
-    print_step(1, 5, "Choose input source", "Paste directly or load a text file containing IPv4 addresses.")
+def choose_input(workflow_preset):
+    print_step(1, workflow_preset.step_total, "Choose input source", "Paste directly or load a text file containing IPv4 addresses.")
 
     while True:
         print_box(
@@ -1295,19 +1610,24 @@ def choose_input():
         print(color("Invalid choice.", WARNING))
 
 
+# ==================================================
+# Profile Selection
+# ==================================================
+
+
 def enabled_enrichment_labels(profile):
     labels = []
     for item in OPTIONAL_ENRICHMENTS:
-        if item["key"] in profile.get("enabled", set()):
-            labels.append(item["label"])
+        if profile.is_enabled(item.key):
+            labels.append(item.label)
     return labels
 
 
 def print_scan_profile_summary(profile):
     enabled_labels = enabled_enrichment_labels(profile)
     lines = [
-        f"{color('Profile', DIM + MUTED)} : {color(profile['name'], BOLD + ACCENT)}",
-        f"{color('Mode', DIM + MUTED)} : {profile['description']}",
+        f"{color('Profile', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}",
+        f"{color('Mode', DIM + MUTED)} : {profile.description}",
     ]
 
     if enabled_labels:
@@ -1318,9 +1638,9 @@ def print_scan_profile_summary(profile):
     else:
         lines.append(f"{color('Extras', DIM + MUTED)} : None")
 
-    if profile.get("prompt_for_details"):
+    if profile.prompt_for_details:
         lines.append(f"{color('Details', DIM + MUTED)} : Ask before showing detailed results")
-    elif "detailed_results" in profile.get("enabled", set()):
+    elif profile.is_enabled("detailed_results"):
         lines.append(f"{color('Details', DIM + MUTED)} : Show detailed results automatically")
     else:
         lines.append(f"{color('Details', DIM + MUTED)} : Skip detailed results")
@@ -1339,25 +1659,26 @@ def build_custom_scan_profile():
         width=min(terminal_width(), 84),
     )
 
-    defaults = SCAN_PROFILES["standard"]["enabled"]
+    defaults = SCAN_PROFILES["standard"].enabled
     enabled = set()
 
     for item in OPTIONAL_ENRICHMENTS:
-        default = "y" if item["key"] in defaults else "n"
-        question = f"Enable {item['label'].lower()}? {item['description']}"
+        default = "y" if item.key in defaults else "n"
+        question = f"Enable {item.label.lower()}? {item.description}"
         if ask_yes_no(question, default=default):
-            enabled.add(item["key"])
+            enabled.add(item.key)
 
-    return {
-        "name": "Custom options",
-        "description": "Manual enrichment selection for this run.",
-        "enabled": enabled,
-        "prompt_for_details": False,
-    }
+    return ScanProfile(
+        key="custom",
+        name="Custom options",
+        description="Manual enrichment selection for this run.",
+        enabled=enabled,
+        prompt_for_details=False,
+    )
 
 
-def choose_scan_profile():
-    print_step(3, 5, "Choose scan profile", "Standard scan is the recommended default.")
+def choose_scan_profile(workflow_preset):
+    print_step(3, workflow_preset.step_total, "Choose scan profile", "Standard scan is the recommended default.")
 
     while True:
         print_box(
@@ -1375,21 +1696,18 @@ def choose_scan_profile():
 
         choice = prompt("Choose a profile [1-5, Enter=2]: ")
         if not choice:
-            choice = "2"
+            choice = "2" if workflow_preset.default_profile_key == "standard" else "1"
 
         if choice == "1":
-            profile = dict(SCAN_PROFILES["quick"])
-            profile["enabled"] = set(profile["enabled"])
+            profile = get_scan_profile("quick")
             print_scan_profile_summary(profile)
             return profile
         if choice == "2":
-            profile = dict(SCAN_PROFILES["standard"])
-            profile["enabled"] = set(profile["enabled"])
+            profile = get_scan_profile("standard")
             print_scan_profile_summary(profile)
             return profile
         if choice == "3":
-            profile = dict(SCAN_PROFILES["deep"])
-            profile["enabled"] = set(profile["enabled"])
+            profile = get_scan_profile("deep")
             print_scan_profile_summary(profile)
             return profile
         if choice == "4":
@@ -1425,75 +1743,66 @@ def sort_results(results, counts):
     return sorted(results, key=sort_key, reverse=True)
 
 
+def render_review_sections(results, counts, invalid_ips, profile):
+    print_result_overview(results, counts)
+    print_results_table(results, counts)
+    render_enabled_enrichments(results, counts, profile)
+    render_detailed_results_if_enabled(results, counts, profile)
+    print_invalid(invalid_ips)
+
+
+def run_lookup_workflow():
+    workflow_preset = get_workflow_preset()
+    ip_text = choose_input(workflow_preset)
+
+    parsed_input = parse_input_text(ip_text)
+
+    if not parsed_input.valid_ips:
+        print(color("\nNo valid IPv4 addresses found.", DANGER))
+        if parsed_input.invalid_ips:
+            print_invalid(parsed_input.invalid_ips)
+        return
+
+    print_step(2, workflow_preset.step_total, "Parse and validate input", "Reviewing deduplicated entries before lookup.")
+    print_input_summary(parsed_input.valid_ips, parsed_input.invalid_ips, parsed_input.counts)
+
+    profile = choose_scan_profile(workflow_preset)
+
+    print_step(
+        4,
+        workflow_preset.step_total,
+        "Run geolocation lookup",
+        (
+            f"Using {profile.name}. "
+            f"Submitting {len(parsed_input.valid_ips)} unique IP"
+            f"{'s' if len(parsed_input.valid_ips) != 1 else ''} to the batch API."
+        ),
+    )
+    raw_results = run_with_spinner("Looking up IPs...", lookup_ips, parsed_input.valid_ips)
+    results = hydrate_result_records(raw_results, parsed_input.counts)
+    results = sort_results(results, parsed_input.counts)
+
+    print_step(
+        5,
+        workflow_preset.step_total,
+        "Review results and export",
+        "Core results come first, then profile-driven enrichments and exports.",
+    )
+    render_review_sections(results, parsed_input.counts, parsed_input.invalid_ips, profile)
+    run_export_flow(results, parsed_input.counts)
+
+
+# ==================================================
+# Main Workflow
+# ==================================================
+
+
 def main():
     enable_windows_terminal()
     show_banner()
 
     try:
-        ip_text = choose_input()
-
-        valid_ips, invalid_ips, counts = extract_ips(ip_text)
-
-        if not valid_ips:
-            print(color("\nNo valid IPv4 addresses found.", DANGER))
-            if invalid_ips:
-                print_invalid(invalid_ips)
-            return
-
-        print_step(2, 5, "Parse and validate input", "Reviewing deduplicated entries before lookup.")
-        print_input_summary(valid_ips, invalid_ips, counts)
-
-        profile = choose_scan_profile()
-
-        print_step(
-            4,
-            5,
-            "Run geolocation lookup",
-            (
-                f"Using {profile['name']}. "
-                f"Submitting {len(valid_ips)} unique IP{'s' if len(valid_ips) != 1 else ''} to the batch API."
-            ),
-        )
-        results = run_with_spinner("Looking up IPs...", lookup_ips, valid_ips)
-        results = sort_results(results, counts)
-
-        print_step(5, 5, "Review results and export", "Core results come first, then profile-driven enrichments and exports.")
-        print_result_overview(results, counts)
-        print_results_table(results, counts)
-
-        if "type_summary" in profile["enabled"]:
-            print_type_summary(results, counts)
-        if "duplicates" in profile["enabled"]:
-            print_duplicates(counts)
-        if "country_grouping" in profile["enabled"]:
-            print_country_grouping(results, counts)
-        if "asn_summary" in profile["enabled"]:
-            print_asn_summary(results, counts)
-        if "subnet_summary" in profile["enabled"]:
-            print_subnet_summary(results, counts)
-
-        if profile.get("prompt_for_details"):
-            if ask_yes_no("Show detailed results too?", default="n"):
-                print_detailed_results(results, counts)
-        elif "detailed_results" in profile["enabled"]:
-            print_detailed_results(results, counts)
-
-        print_invalid(invalid_ips)
-
-        if ask_yes_no("Save results to CSV?", default="n"):
-            filename = prompt("Enter filename [ip_results.csv]: ")
-            if not filename:
-                filename = "ip_results.csv"
-            save_to_csv(results, counts, filename)
-            print(color(f"Saved CSV to {filename}", SUCCESS))
-
-        if ask_yes_no("Save results to JSON too?", default="n"):
-            filename = prompt("Enter filename [ip_results.json]: ")
-            if not filename:
-                filename = "ip_results.json"
-            save_to_json(results, counts, filename)
-            print(color(f"Saved JSON to {filename}", SUCCESS))
-
+        run_lookup_workflow()
     except urllib.error.HTTPError as e:
         print(color(f"HTTP error: {e.code} {e.reason}", DANGER))
     except urllib.error.URLError as e:
