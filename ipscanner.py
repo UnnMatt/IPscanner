@@ -5,6 +5,7 @@ import json
 import sys
 import ipaddress
 import itertools
+import socket
 import shutil
 import threading
 import textwrap
@@ -19,6 +20,7 @@ FIELDS = (
     "status,message,query,country,countryCode,regionName,city,zip,lat,lon,timezone,"
     "isp,org,as,asname,hosting,proxy,mobile"
 )
+TOR_EXIT_LIST_URL = "https://check.torproject.org/torbulkexitlist"
 
 # ==================================================
 # Theme And Display Constants
@@ -137,6 +139,7 @@ def show_banner():
         print(color(line, BOLD + tone))
     print(color("  IP lookup, location info, and quick risk hints", DIM + MUTED))
     print(color("  Terminal tool with CSV and JSON export", DIM + MUTED))
+    print(color("  Type /help at prompts for a quick guide", DIM + MUTED))
 
 
 def header(text, subtitle=None):
@@ -245,8 +248,60 @@ def render_table(columns, rows, tone=PRIMARY):
     print(color(build_table_border("+", "+", "+", widths), tone))
 
 
+def help_score_lines():
+    return [
+        f"{color('Base idea', DIM + MUTED)} : Quick review aid, not a final verdict.",
+        f"{color('Points', DIM + MUTED)} : Hosting +5 | Proxy +5 | Tor exit +6 | Mobile -2",
+        f"{color('Provider text', DIM + MUTED)} : ISP, Org, ASN, and AS Name are checked for infrastructure keywords.",
+        f"{color('Extra clues', DIM + MUTED)} : ASN present +1 | known infra ISP/org match +2 | hosting-like AS name +2",
+        f"{color('Risk bands', DIM + MUTED)} : 9+ VERY HIGH | 6-8 HIGH | 3-5 MEDIUM | 1-2 LOW | 0 or less NONE",
+        f"{color('Type labels', DIM + MUTED)} : High evidence -> Likely Datacenter/VPN | Medium -> Manual Review | Low/None -> Lower suspicion",
+    ]
+
+
+def help_workflow_lines():
+    return [
+        "Core Lookup: normal/default scan path.",
+        "Threat Signals: same core flow, but pushes you toward deeper review.",
+        "Ownership Intel: later-phase shell that currently routes through the core flow.",
+        "Full Investigation: broadest current shell, still built on the core flow.",
+    ]
+
+
+def help_profile_lines():
+    return [
+        "Quick scan: fastest pass, fewer summaries.",
+        "Standard scan: recommended balance for normal use.",
+        "Deep scan: all available summaries and detailed records.",
+        "Custom options: choose each optional summary manually.",
+    ]
+
+
+def help_usage_lines():
+    return [
+        "Paste mode accepts IPv4, IPv6, or mixed input.",
+        "Use /start to begin, /clear to reset pasted input, /cancel to go back.",
+        "Use /help at prompts to reopen this guide.",
+        "Main table is the fast overview. Detailed results are for follow-up review.",
+    ]
+
+
+def show_help():
+    width = min(terminal_width(), 100)
+    header("HELP", "Quick guide to the scan flow, risk points, and settings.")
+    print_box("How It Works", help_usage_lines(), tone=ACCENT, width=width)
+    print_box("Risk Points", help_score_lines(), tone=PRIMARY, width=width)
+    print_box("Workflows", help_workflow_lines(), tone=ACCENT, width=width)
+    print_box("Scan Profiles", help_profile_lines(), tone=PRIMARY, width=width)
+
+
 def prompt(text):
-    return input(color(text, BOLD + ACCENT)).strip()
+    while True:
+        value = input(color(text, BOLD + ACCENT)).strip()
+        if value.lower() == "/help":
+            show_help()
+            continue
+        return value
 
 
 def ask_yes_no(question, default="n"):
@@ -343,7 +398,8 @@ class WorkflowPreset:
     name: str
     description: str
     default_profile_key: str
-    step_total: int = 5
+    step_total: int = 6
+    availability_note: str = ""
 
 
 @dataclass
@@ -367,6 +423,10 @@ class IPResultRecord:
     hosting: Optional[bool] = None
     proxy: Optional[bool] = None
     mobile: Optional[bool] = None
+    tor_exit: Optional[bool] = None
+    tor_status: str = "not_checked"
+    reverse_dns: str = ""
+    reverse_dns_status: str = "not_checked"
     provider_text: str = ""
     suspicion_flag: str = "N/A"
     suspicion_score: Optional[int] = None
@@ -414,6 +474,10 @@ class IPResultRecord:
             "hosting": self.hosting,
             "proxy": self.proxy,
             "mobile": self.mobile,
+            "tor_exit": self.tor_exit,
+            "tor_status": self.tor_status,
+            "reverse_dns": self.reverse_dns,
+            "reverse_dns_status": self.reverse_dns_status,
             "count": self.count,
             "type": self.ip_type,
             "suspicion_flag": self.suspicion_flag,
@@ -641,7 +705,7 @@ OPTIONAL_ENRICHMENTS = [
     EnrichmentOption(
         key="subnet_summary",
         label="Subnet summary",
-        description="Top /24 ranges by unique IP count and total hits.",
+        description="Top IPv4 /24 and IPv6 /64 ranges by unique IP count and total hits.",
     ),
     EnrichmentOption(
         key="detailed_results",
@@ -654,34 +718,60 @@ SCAN_PROFILES = {
     "quick": ScanProfile(
         key="quick",
         name="Quick scan",
-        description="Fastest view with the core results plus the most useful rollups.",
+        description="Fastest first pass.",
         enabled={"type_summary", "duplicates"},
         prompt_for_details=False,
     ),
     "standard": ScanProfile(
         key="standard",
         name="Standard scan",
-        description="Recommended default with the best balance of speed and enrichment.",
+        description="Best default balance.",
         enabled={"type_summary", "duplicates", "country_grouping", "asn_summary", "subnet_summary"},
         prompt_for_details=True,
     ),
     "deep": ScanProfile(
         key="deep",
         name="Deep scan",
-        description="Full review mode with every summary and detailed per-IP output enabled.",
+        description="All available summaries and details.",
         enabled={item.key for item in OPTIONAL_ENRICHMENTS},
         prompt_for_details=False,
     ),
 }
 
-DEFAULT_WORKFLOW_PRESET_KEY = "classic"
+WORKFLOW_MENU_ORDER = [
+    "core_lookup",
+    "threat_signals",
+    "ownership_intel",
+    "full_investigation",
+]
+
+DEFAULT_WORKFLOW_PRESET_KEY = "core_lookup"
 WORKFLOW_PRESETS = {
-    DEFAULT_WORKFLOW_PRESET_KEY: WorkflowPreset(
-        key=DEFAULT_WORKFLOW_PRESET_KEY,
-        name="Classic terminal flow",
-        description="The current familiar prompt -> lookup -> review -> export workflow.",
+    "core_lookup": WorkflowPreset(
+        key="core_lookup",
+        name="Core Lookup",
+        description="Best for most checks.",
         default_profile_key="standard",
-        step_total=5,
+    ),
+    "threat_signals": WorkflowPreset(
+        key="threat_signals",
+        name="Threat Signals",
+        description="Stronger signal-focused review.",
+        default_profile_key="deep",
+    ),
+    "ownership_intel": WorkflowPreset(
+        key="ownership_intel",
+        name="Ownership Intel",
+        description="Ownership-oriented path.",
+        default_profile_key="standard",
+        availability_note="Later phase. Uses the core lookup flow for now.",
+    ),
+    "full_investigation": WorkflowPreset(
+        key="full_investigation",
+        name="Full Investigation",
+        description="Broadest current review.",
+        default_profile_key="deep",
+        availability_note="Later phase. Uses the broadest current scan path for now.",
     ),
 }
 
@@ -692,6 +782,83 @@ def get_scan_profile(profile_key):
 
 def get_workflow_preset(preset_key=DEFAULT_WORKFLOW_PRESET_KEY):
     return WORKFLOW_PRESETS[preset_key]
+
+
+def workflow_menu_lines():
+    lines = []
+
+    for index, preset_key in enumerate(WORKFLOW_MENU_ORDER, start=1):
+        preset = WORKFLOW_PRESETS[preset_key]
+        if preset.key == DEFAULT_WORKFLOW_PRESET_KEY:
+            prefix = color("Recommended", BOLD + SUCCESS)
+        elif preset.availability_note:
+            prefix = color("Later phase", BOLD + WARNING)
+        else:
+            prefix = color("Available", BOLD + ACCENT)
+        lines.append(f"{color(str(index), BOLD + ACCENT)}  {preset.name.ljust(18)} {prefix}  {preset.description}")
+
+    lines.append(f"{color(str(len(WORKFLOW_MENU_ORDER) + 1), BOLD + ACCENT)}  Exit")
+    return lines
+
+
+def print_compact_message(text, tone=DIM + MUTED, indent=2):
+    width = max(30, terminal_width() - indent - 2)
+    wrapped = textwrap.wrap(text, width=width) or [""]
+    for part in wrapped:
+        print((" " * indent) + color(part, tone))
+
+
+def print_workflow_preset_summary(workflow_preset):
+    lines = [
+        f"{color('Workflow', DIM + MUTED)} : {color(workflow_preset.name, BOLD + ACCENT)}",
+        f"{color('Focus', DIM + MUTED)} : {workflow_preset.description}",
+    ]
+    if workflow_preset.availability_note:
+        lines.append(f"{color('Status', DIM + MUTED)} : {workflow_preset.availability_note}")
+    print_box("Workflow Selected", lines, tone=ACCENT, width=min(terminal_width(), 92))
+
+
+def get_recommended_scan_profile(workflow_preset):
+    return get_scan_profile(workflow_preset.default_profile_key)
+
+
+def print_recommended_scan_setup(workflow_preset, profile):
+    print_box(
+        "Recommended Scan Setup",
+        [
+            f"{color('Profile', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}",
+            f"{color('Reason', DIM + MUTED)} : {profile.description}",
+        ],
+        tone=ACCENT,
+        width=min(terminal_width(), 88),
+    )
+
+
+def choose_workflow_preset():
+    print_step(1, WORKFLOW_PRESETS[DEFAULT_WORKFLOW_PRESET_KEY].step_total, "Choose workflow", "Core Lookup is the best starting point for most scans.")
+
+    while True:
+        print_box(
+            "Main Menu",
+            workflow_menu_lines(),
+            tone=PRIMARY,
+            width=min(terminal_width(), 92),
+        )
+
+        choice = prompt(f"Choose a workflow [1-{len(WORKFLOW_MENU_ORDER) + 1}, Enter=1]: ")
+        if not choice:
+            choice = "1"
+
+        if choice.isdigit():
+            choice_number = int(choice)
+            if 1 <= choice_number <= len(WORKFLOW_MENU_ORDER):
+                workflow_preset = get_workflow_preset(WORKFLOW_MENU_ORDER[choice_number - 1])
+                print_workflow_preset_summary(workflow_preset)
+                return workflow_preset
+            if choice_number == len(WORKFLOW_MENU_ORDER) + 1:
+                sys.exit(0)
+
+        print(color("Invalid choice.", WARNING))
 
 
 def suspicion_color(label):
@@ -711,14 +878,34 @@ def suspicion_color(label):
 # ==================================================
 
 
+def parse_ip_token(value):
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def normalize_ip_token(value):
+    parsed = parse_ip_token(value)
+    if parsed is None:
+        return None
+    return str(parsed)
+
+
+def detect_ip_version(value):
+    parsed = parse_ip_token(value)
+    if parsed is None:
+        return None
+    return parsed.version
+
+
+def is_valid_ip(ip):
+    return parse_ip_token(ip) is not None
+
+
 def is_valid_ipv4(ip):
-    pattern = re.compile(
-        r"^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\."
-        r"(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\."
-        r"(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\."
-        r"(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$"
-    )
-    return bool(pattern.match(ip))
+    parsed = parse_ip_token(ip)
+    return parsed is not None and parsed.version == 4
 
 
 def parse_input_text(text):
@@ -729,8 +916,9 @@ def parse_input_text(text):
     invalid = []
 
     for item in raw_items:
-        if is_valid_ipv4(item):
-            valid.append(item)
+        normalized = normalize_ip_token(item)
+        if normalized is not None:
+            valid.append(normalized)
         else:
             invalid.append(item)
 
@@ -783,6 +971,101 @@ def lookup_ips(ips):
 
 
 # ==================================================
+# Enrichment Logic
+# ==================================================
+
+
+def reverse_dns_lookup(ip, timeout=2.0):
+    state = {
+        "hostname": "",
+        "status": "error",
+    }
+    finished = threading.Event()
+
+    def worker():
+        try:
+            host, aliases, _ = socket.gethostbyaddr(ip)
+            hostname = (host or "").strip().rstrip(".")
+            if not hostname and aliases:
+                hostname = aliases[0].strip().rstrip(".")
+
+            if hostname:
+                state["hostname"] = hostname
+                state["status"] = "found"
+            else:
+                state["status"] = "not_found"
+        except (socket.herror, socket.gaierror, UnicodeError):
+            state["status"] = "not_found"
+        except Exception:
+            state["status"] = "error"
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    if not finished.wait(timeout):
+        return "", "timeout"
+
+    return state["hostname"], state["status"]
+
+
+def enrich_record_with_reverse_dns(record, timeout=2.0):
+    hostname, status = reverse_dns_lookup(record.query, timeout=timeout)
+    record.reverse_dns = hostname
+    record.reverse_dns_status = status
+    return record
+
+
+def enrich_records_with_reverse_dns(records, timeout=2.0):
+    for record in records:
+        enrich_record_with_reverse_dns(record, timeout=timeout)
+    return records
+
+
+# ==================================================
+# Threat-Signal Components
+# ==================================================
+
+
+def fetch_tor_exit_nodes(timeout=5.0):
+    req = urllib.request.Request(
+        TOR_EXIT_LIST_URL,
+        headers={"User-Agent": "ipscanner/1.0"},
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        content = response.read().decode("utf-8", errors="replace")
+
+    exit_nodes = set()
+    for line in content.splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        normalized = normalize_ip_token(value)
+        if normalized is not None:
+            exit_nodes.add(normalized)
+
+    return exit_nodes
+
+
+def enrich_records_with_tor_signal(records, timeout=5.0):
+    try:
+        exit_nodes = fetch_tor_exit_nodes(timeout=timeout)
+    except Exception:
+        for record in records:
+            record.tor_exit = None
+            record.tor_status = "unavailable"
+        return records
+
+    for record in records:
+        record.tor_exit = record.query in exit_nodes
+        record.tor_status = "listed" if record.tor_exit else "not_listed"
+
+    return records
+
+
+# ==================================================
 # Scoring, Classification, And Record Hydration
 # ==================================================
 
@@ -822,6 +1105,10 @@ def compute_suspicion_score(item):
     if item.get("proxy") is True:
         score += 5
         reasons.append("proxy=true")
+
+    if item.get("tor_exit") is True:
+        score += 6
+        reasons.append("tor_exit=true")
 
     if item.get("mobile") is True:
         score -= 2
@@ -931,6 +1218,8 @@ def build_result_record(item, counts):
         hosting=item.get("hosting"),
         proxy=item.get("proxy"),
         mobile=item.get("mobile"),
+        tor_exit=None,
+        tor_status="not_checked",
         raw=dict(item),
     )
     record.provider_text = collect_provider_text(record)
@@ -966,11 +1255,108 @@ def safe(value, max_len=None):
     return text
 
 
+def ip_column_width():
+    return 28
+
+
+def ip_min_width():
+    return 18
+
+
+def truncate_middle(value, max_len):
+    text = str(value) if value is not None else "N/A"
+    if not max_len or len(text) <= max_len:
+        return text
+    if max_len <= 5:
+        return safe(text, max_len)
+
+    left = (max_len - 3) // 2
+    right = max_len - 3 - left
+    return text[:left] + "..." + text[-right:]
+
+
+def format_ip_display(value, max_len):
+    text = str(value) if value is not None else "N/A"
+    if ":" in text:
+        return truncate_middle(text, max_len)
+    return safe(text, max_len)
+
+
+def format_subnet_display(value, max_len):
+    text = str(value) if value is not None else "N/A"
+    if ":" in text:
+        return truncate_middle(text, max_len)
+    return safe(text, max_len)
+
+
+def detailed_box_title(ip, seen, width):
+    suffix = f"  |  seen {seen}x"
+    available = max(12, width - len(suffix) - 6)
+    return f"{format_ip_display(ip, available)}{suffix}"
+
+
+def format_reverse_dns(item):
+    hostname = item.get("reverse_dns", "")
+    status = item.get("reverse_dns_status", "not_checked")
+
+    if hostname:
+        return hostname
+    if status == "not_found":
+        return "Not found"
+    if status == "timeout":
+        return "Timed out"
+    if status == "error":
+        return "Unavailable"
+    return "Not checked"
+
+
+def format_tor_status(item):
+    if item.get("tor_exit") is True:
+        return "Yes"
+
+    status = item.get("tor_status", "not_checked")
+    if status == "not_listed":
+        return "No"
+    if status == "unavailable":
+        return "Unavailable"
+    return "Not checked"
+
+
+def has_positive_reverse_dns(item):
+    return bool(item.get("reverse_dns", ""))
+
+
+def has_interesting_tor_state(item):
+    status = item.get("tor_status", "not_checked")
+    return item.get("tor_exit") is True or status == "unavailable"
+
+
+def subnet_label_for_ip(value):
+    parsed = parse_ip_token(value)
+    if parsed is None:
+        return None
+
+    prefix = 24 if parsed.version == 4 else 64
+    return str(ipaddress.ip_network(f"{parsed}/{prefix}", strict=False))
+
+
 def format_location(item):
     country = item.get("country", "N/A")
     city = item.get("city", "N/A")
     if country and city and country != "N/A" and city != "N/A":
         return f"{country} / {city}"
+    return country or city or "N/A"
+
+
+def format_detailed_location(item):
+    country = item.get("country", "N/A") or "N/A"
+    region = item.get("regionName", "N/A") or "N/A"
+    city = item.get("city", "N/A") or "N/A"
+
+    parts = [part for part in (country, region, city) if part and part != "N/A"]
+    if parts:
+        return " / ".join(parts)
+
     return country or city or "N/A"
 
 
@@ -982,8 +1368,95 @@ def format_provider(item):
     return isp if isp not in {"", None} else (org or "N/A")
 
 
+def format_network(item):
+    asn = item.get("as", "") or ""
+    asname = item.get("asname", "") or ""
+
+    if asn and asname:
+        return f"{asn} / {asname}"
+    if asn:
+        return asn
+    if asname:
+        return asname
+    return "N/A"
+
+
+def format_signal_summary(item):
+    parts = []
+    if item.get("tor_exit") is True:
+        parts.append("Tor")
+    if item.get("proxy"):
+        parts.append("Proxy")
+    if item.get("hosting"):
+        parts.append("Hosting")
+    if item.get("mobile"):
+        parts.append("Mobile")
+    return ", ".join(parts) if parts else "None"
+
+
+def format_risk_summary(item):
+    flag, _, score = suspicion_score(item)
+    return f"{flag}  |  score {score}  |  {likely_type(item)}"
+
+
+def summarize_duplicates(counts):
+    return [(ip, count) for ip, count in counts.items() if count > 1]
+
+
+def summarize_country_groups(results, counts):
+    country_map = defaultdict(list)
+
+    for item in results:
+        if item.get("status") == "success":
+            country = item.get("country", "Unknown") or "Unknown"
+            country_map[country].append(item)
+
+    summary = []
+    for country, items in country_map.items():
+        total_hits = sum(counts.get(item.get("query", ""), 1) for item in items)
+        summary.append((country, items, total_hits))
+
+    summary.sort(key=lambda entry: (entry[2], len(entry[1]), entry[0]), reverse=True)
+    return [entry for entry in summary if len(entry[1]) > 1 or entry[2] > 1]
+
+
+def summarize_asn_rows(results, counts):
+    summary = defaultdict(lambda: {"unique": 0, "hits": 0})
+
+    for item in results:
+        if item.get("status") != "success":
+            continue
+
+        asn = item.get("as", "Unknown") or "Unknown"
+        asname = item.get("asname", "Unknown") or "Unknown"
+        label = f"{asn} | {asname}"
+        summary[label]["unique"] += 1
+        summary[label]["hits"] += counts.get(item.get("query", ""), 1)
+
+    ranked = sorted(summary.items(), key=lambda entry: (entry[1]["hits"], entry[1]["unique"]), reverse=True)
+    return [(label, data) for label, data in ranked if data["unique"] > 1 or data["hits"] > 1]
+
+
+def summarize_subnet_rows(results, counts):
+    summary = defaultdict(lambda: {"unique": 0, "hits": 0})
+
+    for item in results:
+        query = item.get("query", "")
+        subnet = subnet_label_for_ip(query)
+        if subnet is None:
+            continue
+
+        summary[subnet]["unique"] += 1
+        summary[subnet]["hits"] += counts.get(query, 1)
+
+    ranked = sorted(summary.items(), key=lambda entry: (entry[1]["hits"], entry[1]["unique"]), reverse=True)
+    return [(subnet, data) for subnet, data in ranked if data["unique"] > 1 or data["hits"] > 1]
+
+
 def format_signals(item):
     labels = []
+    if item.get("tor_exit"):
+        labels.append("Tor")
     if item.get("hosting"):
         labels.append("Hosting")
     if item.get("proxy"):
@@ -997,6 +1470,8 @@ def format_signals(item):
 
 
 def signal_tone(item):
+    if item.get("tor_exit"):
+        return MAGENTA
     if item.get("proxy"):
         return DANGER
     if item.get("hosting"):
@@ -1088,7 +1563,7 @@ def print_results_table(results, counts):
     )
 
     columns = [
-        {"title": "IP", "width": 15, "min_width": 15},
+        {"title": "IP", "width": ip_column_width(), "min_width": ip_min_width()},
         {"title": "Hits", "width": 4, "min_width": 4, "align": "right"},
         {"title": "Location", "width": 20, "min_width": 14},
         {"title": "Provider", "width": 24, "min_width": 16},
@@ -1109,7 +1584,7 @@ def print_results_table(results, counts):
 
         if item.get("status") != "success":
             rows.append([
-                color(safe(ip, columns[0]["width"]), BOLD + DANGER),
+                color(format_ip_display(ip, columns[0]["width"]), BOLD + DANGER),
                 hits,
                 color("Lookup failed", DANGER),
                 safe(item.get("message", "Unknown error"), columns[3]["width"]),
@@ -1128,7 +1603,7 @@ def print_results_table(results, counts):
         type_text = safe(ip_type, columns[7]["width"])
 
         rows.append([
-            color(safe(ip, columns[0]["width"]), ip_tone),
+            color(format_ip_display(ip, columns[0]["width"]), ip_tone),
             hits,
             safe(format_location(item), columns[2]["width"]),
             safe(format_provider(item), columns[3]["width"]),
@@ -1142,7 +1617,7 @@ def print_results_table(results, counts):
 
 
 def print_detailed_results(results, counts):
-    header("DETAILED RESULTS", "Expanded view for full geolocation and provider context.")
+    header("DETAILED RESULTS", "Condensed per-IP view focused on the most useful context.")
     width = min(terminal_width(), 104)
 
     for item in results:
@@ -1150,9 +1625,15 @@ def print_detailed_results(results, counts):
         seen = counts.get(ip, 1)
 
         if item.get("status") != "success":
+            lines = []
+            if has_interesting_tor_state(item):
+                lines.extend(wrap_label_value("Tor", format_tor_status(item), width, MAGENTA if item.get("tor_exit") else None))
+            if has_positive_reverse_dns(item):
+                lines.extend(wrap_label_value("rDNS", format_reverse_dns(item), width))
+            lines.extend(wrap_label_value("Status", f"Lookup failed: {item.get('message', 'Unknown error')}", width, DANGER))
             print_box(
-                f"{ip}  |  seen {seen}x",
-                wrap_label_value("Status", f"Lookup failed: {item.get('message', 'Unknown error')}", width, DANGER),
+                detailed_box_title(ip, seen, width),
+                lines,
                 tone=DANGER,
                 width=width,
             )
@@ -1160,45 +1641,38 @@ def print_detailed_results(results, counts):
 
         flag, reasons, score = suspicion_score(item)
         lines = []
-        lines.extend(wrap_label_value("Location", f"{item.get('country', 'N/A')} / {item.get('regionName', 'N/A')} / {item.get('city', 'N/A')}", width))
-        lines.extend(wrap_label_value("ZIP", item.get("zip", "N/A"), width))
-        lines.extend(wrap_label_value("Timezone", item.get("timezone", "N/A"), width))
-        lines.extend(wrap_label_value("Coords", f"{item.get('lat', 'N/A')}, {item.get('lon', 'N/A')}", width))
-        lines.extend(wrap_label_value("ISP", item.get("isp", "N/A"), width))
-        lines.extend(wrap_label_value("Org", item.get("org", "N/A"), width))
-        lines.extend(wrap_label_value("ASN", item.get("as", "N/A"), width))
-        lines.extend(wrap_label_value("AS Name", item.get("asname", "N/A"), width))
-        lines.extend(wrap_label_value(
-            "Signals",
-            f"Hosting {('Yes' if item.get('hosting') else 'No')} | "
-            f"Proxy {('Yes' if item.get('proxy') else 'No')} | "
-            f"Mobile {('Yes' if item.get('mobile') else 'No')}",
-            width,
-        ))
-        lines.extend(wrap_label_value("Type", likely_type(item), width))
-        lines.extend(wrap_label_value("Risk", f"{flag}  |  score {score}", width, suspicion_color(flag)))
+        lines.extend(wrap_label_value("Location", format_detailed_location(item), width))
+        lines.extend(wrap_label_value("Provider", format_provider(item), width))
+
+        network_text = format_network(item)
+        if network_text != "N/A":
+            lines.extend(wrap_label_value("Network", network_text, width))
+
+        if has_interesting_tor_state(item):
+            lines.extend(wrap_label_value("Tor", format_tor_status(item), width, MAGENTA if item.get("tor_exit") else None))
+
+        if has_positive_reverse_dns(item):
+            lines.extend(wrap_label_value("rDNS", format_reverse_dns(item), width))
+
+        signal_summary = format_signal_summary(item)
+        if signal_summary != "None":
+            lines.extend(wrap_label_value("Signals", signal_summary, width))
+
+        lines.extend(wrap_label_value("Risk", format_risk_summary(item), width, suspicion_color(flag)))
         lines.extend(wrap_label_value("Reasons", ", ".join(reasons) if reasons else "None", width))
 
-        print_box(f"{ip}  |  seen {seen}x", lines, tone=suspicion_color(flag), width=width)
+        print_box(detailed_box_title(ip, seen, width), lines, tone=suspicion_color(flag), width=width)
 
 
 def print_country_grouping(results, counts):
-    country_map = defaultdict(list)
+    groups = summarize_country_groups(results, counts)
 
-    for item in results:
-        if item.get("status") == "success":
-            country = item.get("country", "Unknown") or "Unknown"
-            country_map[country].append(item)
-
-    header("GROUPED BY COUNTRY", "Country buckets keep related results together for quick review.")
-
-    if not country_map:
-        print_box("Grouped By Country", [color("No successful results to group.", WARNING)], tone=WARNING)
+    if not groups:
         return
 
-    for country in sorted(country_map.keys()):
-        items = country_map[country]
-        total_hits = sum(counts.get(item.get("query", ""), 1) for item in items)
+    header("GROUPED BY COUNTRY", "Only countries with multiple hits are shown to keep this section focused.")
+
+    for country, items, total_hits in groups:
         print_box(
             country,
             [
@@ -1210,7 +1684,7 @@ def print_country_grouping(results, counts):
         )
 
         columns = [
-            {"title": "IP", "width": 15, "min_width": 15},
+            {"title": "IP", "width": ip_column_width(), "min_width": ip_min_width()},
             {"title": "City", "width": 18, "min_width": 12},
             {"title": "Provider", "width": 26, "min_width": 16},
             {"title": "Risk", "width": 10, "min_width": 8},
@@ -1225,7 +1699,7 @@ def print_country_grouping(results, counts):
             flag, _, _ = suspicion_score(item)
             type_text = safe(likely_type(item), columns[4]["width"])
             rows.append([
-                safe(item.get("query", "N/A"), columns[0]["width"]),
+                format_ip_display(item.get("query", "N/A"), columns[0]["width"]),
                 safe(item.get("city", "N/A"), columns[1]["width"]),
                 safe(format_provider(item), columns[2]["width"]),
                 color(safe(flag, columns[3]["width"]), BOLD + suspicion_color(flag)),
@@ -1236,20 +1710,19 @@ def print_country_grouping(results, counts):
 
 
 def print_duplicates(counts):
-    header("DUPLICATE SUMMARY", "Repeated IPs are shown first so reuse stands out immediately.")
-
-    duplicates = [(ip, count) for ip, count in counts.items() if count > 1]
+    duplicates = summarize_duplicates(counts)
 
     if not duplicates:
-        print_box("Duplicate Summary", [color("No duplicate IPs found.", SUCCESS)], tone=SUCCESS)
         return
+
+    header("DUPLICATE SUMMARY", "Repeated IPs are shown first so reuse stands out immediately.")
 
     duplicates.sort(key=lambda x: x[1], reverse=True)
     columns = [
-        {"title": "IP", "width": 15, "min_width": 15},
+        {"title": "IP", "width": ip_column_width(), "min_width": ip_min_width()},
         {"title": "Seen", "width": 5, "min_width": 5, "align": "right"},
     ]
-    rows = [[ip, color(str(count), BOLD + ACCENT)] for ip, count in duplicates]
+    rows = [[format_ip_display(ip, columns[0]["width"]), color(str(count), BOLD + ACCENT)] for ip, count in duplicates]
     render_table(columns, rows, tone=ACCENT)
 
 
@@ -1257,7 +1730,7 @@ def print_invalid(invalid):
     if not invalid:
         return
 
-    header("INVALID / SKIPPED", "Entries below were ignored because they were not valid IPv4 addresses.")
+    header("INVALID / SKIPPED", "Entries below were ignored because they were not valid IP addresses.")
     wrapped = textwrap.wrap(", ".join(invalid), width=max(30, min(terminal_width(), 100) - 8))
     print_box("Skipped Entries", [color(line, WARNING) for line in wrapped], tone=WARNING, width=min(terminal_width(), 100))
 
@@ -1294,25 +1767,13 @@ def print_type_summary(results, counts):
 
 
 def print_asn_summary(results, counts, limit=10):
-    summary = defaultdict(lambda: {"unique": 0, "hits": 0})
+    ranked = summarize_asn_rows(results, counts)
 
-    for item in results:
-        if item.get("status") != "success":
-            continue
-
-        asn = item.get("as", "Unknown") or "Unknown"
-        asname = item.get("asname", "Unknown") or "Unknown"
-        label = f"{asn} | {asname}"
-        summary[label]["unique"] += 1
-        summary[label]["hits"] += counts.get(item.get("query", ""), 1)
-
-    header("ASN SUMMARY", "Top networks by unique IP count and total hits.")
-
-    if not summary:
-        print_box("ASN Summary", [color("No successful ASN data available.", WARNING)], tone=WARNING)
+    if not ranked:
         return
 
-    ranked = sorted(summary.items(), key=lambda entry: (entry[1]["hits"], entry[1]["unique"]), reverse=True)
+    header("ASN SUMMARY", "Only repeated or clustered networks are shown.")
+
     columns = [
         {"title": "ASN / Name", "width": 44, "min_width": 24},
         {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
@@ -1336,33 +1797,26 @@ def print_asn_summary(results, counts, limit=10):
 
 
 def print_subnet_summary(results, counts, limit=10):
-    summary = defaultdict(lambda: {"unique": 0, "hits": 0})
+    ranked = summarize_subnet_rows(results, counts)
 
-    for item in results:
-        query = item.get("query", "")
-        if not is_valid_ipv4(query):
-            continue
-
-        subnet = str(ipaddress.ip_network(f"{query}/24", strict=False))
-        summary[subnet]["unique"] += 1
-        summary[subnet]["hits"] += counts.get(query, 1)
-
-    header("SUBNET SUMMARY", "Top /24 ranges by unique IP count and total hits.")
-
-    if not summary:
-        print_box("Subnet Summary", [color("No subnet data available.", WARNING)], tone=WARNING)
+    if not ranked:
         return
 
-    ranked = sorted(summary.items(), key=lambda entry: (entry[1]["hits"], entry[1]["unique"]), reverse=True)
+    header("SUBNET SUMMARY", "Only repeated IPv4 /24 and IPv6 /64 ranges are shown.")
+
     columns = [
-        {"title": "/24 Subnet", "width": 18, "min_width": 18},
+        {"title": "Subnet", "width": 43, "min_width": 18},
         {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
         {"title": "Hits", "width": 6, "min_width": 6, "align": "right"},
     ]
+    fitted = fit_column_widths(columns)
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+
     rows = []
     for subnet, data in ranked[:limit]:
         rows.append([
-            subnet,
+            format_subnet_display(subnet, columns[0]["width"]),
             color(str(data["unique"]), BOLD + ACCENT),
             color(str(data["hits"]), BOLD + ACCENT),
         ])
@@ -1417,6 +1871,10 @@ def save_to_csv(results, counts, filename="ip_results.csv"):
             "IP",
             "Count",
             "Status",
+            "TorExit",
+            "TorStatus",
+            "ReverseDNS",
+            "ReverseDNSStatus",
             "Country",
             "CountryCode",
             "Region",
@@ -1455,6 +1913,10 @@ def save_to_csv(results, counts, filename="ip_results.csv"):
                 ip,
                 item.get("count", counts.get(ip, 1)),
                 item.get("status", ""),
+                item.get("tor_exit", ""),
+                item.get("tor_status", ""),
+                item.get("reverse_dns", ""),
+                item.get("reverse_dns_status", ""),
                 item.get("country", ""),
                 item.get("countryCode", ""),
                 item.get("regionName", ""),
@@ -1539,7 +2001,7 @@ def read_from_paste():
         [
             "Paste your IPs below.",
             "Type /start on a new line when you want to begin the lookup.",
-            "Type /clear to reset your pasted input or /cancel to go back.",
+            "Type /clear to reset your pasted input, /cancel to go back, or /help for the guide.",
         ],
         tone=ACCENT,
         width=min(terminal_width(), 82),
@@ -1569,34 +2031,38 @@ def read_from_paste():
             print(color("Paste mode cancelled.", WARNING))
             return None
 
+        if command == "/help":
+            show_help()
+            continue
+
         lines.append(line)
 
     return "\n".join(lines)
 
 
 def choose_input(workflow_preset):
-    print_step(1, workflow_preset.step_total, "Choose input source", "Paste directly or load a text file containing IPv4 addresses.")
+    print_step(2, workflow_preset.step_total, "Choose input source", "Select how you want to provide the IPs.")
 
     while True:
         print_box(
             "Input Source",
             [
-                f"{color('1', BOLD + ACCENT)}  Paste IPs manually",
-                f"{color('2', BOLD + ACCENT)}  Load IPs from file",
-                f"{color('3', BOLD + ACCENT)}  Exit",
+                f"{color('Enter', BOLD + ACCENT)}  Paste IPs manually",
+                f"{color('F', BOLD + ACCENT)}      Load IPs from file",
+                f"{color('Q', BOLD + ACCENT)}      Exit",
             ],
             tone=PRIMARY,
             width=min(terminal_width(), 72),
         )
 
-        choice = prompt("Choose an option [1-3]: ")
+        choice = prompt("Input source [Enter/F/Q]: ").lower()
 
-        if choice == "1":
+        if not choice:
             pasted = read_from_paste()
             if pasted is None:
                 continue
             return pasted
-        if choice == "2":
+        if choice in {"f", "file"}:
             path = prompt("Enter file path: ").strip().strip('"')
             try:
                 return read_from_file(path)
@@ -1605,9 +2071,9 @@ def choose_input(workflow_preset):
             except Exception as e:
                 print(color(f"Failed to read file: {e}", DANGER))
             continue
-        if choice == "3":
+        if choice in {"q", "quit", "exit"}:
             sys.exit(0)
-        print(color("Invalid choice.", WARNING))
+        print(color("Use Enter for paste mode, F for file, or Q to exit.", WARNING))
 
 
 # ==================================================
@@ -1624,28 +2090,15 @@ def enabled_enrichment_labels(profile):
 
 
 def print_scan_profile_summary(profile):
-    enabled_labels = enabled_enrichment_labels(profile)
-    lines = [
-        f"{color('Profile', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}",
-        f"{color('Mode', DIM + MUTED)} : {profile.description}",
-    ]
-
-    if enabled_labels:
-        wrapped = textwrap.wrap(", ".join(enabled_labels), width=max(28, min(terminal_width(), 92) - 20)) or [""]
-        lines.append(f"{color('Extras', DIM + MUTED)} : {wrapped[0]}")
-        for part in wrapped[1:]:
-            lines.append((" " * 11) + part)
-    else:
-        lines.append(f"{color('Extras', DIM + MUTED)} : None")
-
-    if profile.prompt_for_details:
-        lines.append(f"{color('Details', DIM + MUTED)} : Ask before showing detailed results")
-    elif profile.is_enabled("detailed_results"):
-        lines.append(f"{color('Details', DIM + MUTED)} : Show detailed results automatically")
-    else:
-        lines.append(f"{color('Details', DIM + MUTED)} : Skip detailed results")
-
-    print_box("Scan Profile", lines, tone=ACCENT, width=min(terminal_width(), 92))
+    print_box(
+        "Scan Profile",
+        [
+            f"{color('Selected', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}",
+            f"{color('Mode', DIM + MUTED)} : {profile.description}",
+        ],
+        tone=ACCENT,
+        width=min(terminal_width(), 84),
+    )
 
 
 def build_custom_scan_profile():
@@ -1677,26 +2130,34 @@ def build_custom_scan_profile():
     )
 
 
-def choose_scan_profile(workflow_preset):
-    print_step(3, workflow_preset.step_total, "Choose scan profile", "Standard scan is the recommended default.")
+def choose_scan_profile(workflow_preset, show_step=True):
+    if show_step:
+        print_step(4, workflow_preset.step_total, "Choose scan profile", "Pick a different scan profile only if you want to override the recommended setup.")
+
+    default_choices = {
+        "quick": "1",
+        "standard": "2",
+        "deep": "3",
+    }
+    default_choice = default_choices.get(workflow_preset.default_profile_key, "2")
 
     while True:
         print_box(
             "Scan Profiles",
             [
-                f"{color('1', BOLD + ACCENT)}  Quick scan     Fastest core view with a few high-value summaries",
-                f"{color('2', BOLD + ACCENT)}  Standard scan  Recommended default balance of speed and enrichment",
-                f"{color('3', BOLD + ACCENT)}  Deep scan      All summaries plus full detailed results",
-                f"{color('4', BOLD + ACCENT)}  Custom options Choose optional enrichments manually",
+                f"{color('1', BOLD + ACCENT)}  Quick scan     Fastest first pass",
+                f"{color('2', BOLD + ACCENT)}  Standard scan  Best default balance",
+                f"{color('3', BOLD + ACCENT)}  Deep scan      All available summaries and details",
+                f"{color('4', BOLD + ACCENT)}  Custom options Choose enrichments manually",
                 f"{color('5', BOLD + ACCENT)}  Exit",
             ],
             tone=PRIMARY,
-            width=min(terminal_width(), 92),
+            width=min(terminal_width(), 84),
         )
 
-        choice = prompt("Choose a profile [1-5, Enter=2]: ")
+        choice = prompt(f"Choose a profile [1-5, Enter={default_choice}]: ")
         if not choice:
-            choice = "2" if workflow_preset.default_profile_key == "standard" else "1"
+            choice = default_choice
 
         if choice == "1":
             profile = get_scan_profile("quick")
@@ -1718,6 +2179,17 @@ def choose_scan_profile(workflow_preset):
             sys.exit(0)
 
         print(color("Invalid choice.", WARNING))
+
+
+def choose_scan_setup(workflow_preset):
+    print_step(4, workflow_preset.step_total, "Confirm scan setup", "The recommended setup is the easiest path.")
+    recommended_profile = get_recommended_scan_profile(workflow_preset)
+    print_recommended_scan_setup(workflow_preset, recommended_profile)
+
+    if ask_yes_no("Use the recommended scan setup?", default="y"):
+        return recommended_profile
+
+    return choose_scan_profile(workflow_preset, show_step=False)
 
 
 def sort_results(results, counts):
@@ -1752,38 +2224,40 @@ def render_review_sections(results, counts, invalid_ips, profile):
 
 
 def run_lookup_workflow():
-    workflow_preset = get_workflow_preset()
+    workflow_preset = choose_workflow_preset()
     ip_text = choose_input(workflow_preset)
 
     parsed_input = parse_input_text(ip_text)
 
     if not parsed_input.valid_ips:
-        print(color("\nNo valid IPv4 addresses found.", DANGER))
+        print(color("\nNo valid IP addresses found.", DANGER))
         if parsed_input.invalid_ips:
             print_invalid(parsed_input.invalid_ips)
         return
 
-    print_step(2, workflow_preset.step_total, "Parse and validate input", "Reviewing deduplicated entries before lookup.")
+    print_step(3, workflow_preset.step_total, "Parse and validate input", "Reviewing deduplicated entries before lookup.")
     print_input_summary(parsed_input.valid_ips, parsed_input.invalid_ips, parsed_input.counts)
 
-    profile = choose_scan_profile(workflow_preset)
+    profile = choose_scan_setup(workflow_preset)
 
     print_step(
-        4,
+        5,
         workflow_preset.step_total,
         "Run geolocation lookup",
         (
-            f"Using {profile.name}. "
+            f"Using {profile.name} under {workflow_preset.name}. "
             f"Submitting {len(parsed_input.valid_ips)} unique IP"
             f"{'s' if len(parsed_input.valid_ips) != 1 else ''} to the batch API."
         ),
     )
     raw_results = run_with_spinner("Looking up IPs...", lookup_ips, parsed_input.valid_ips)
     results = hydrate_result_records(raw_results, parsed_input.counts)
+    results = run_with_spinner("Resolving reverse DNS...", enrich_records_with_reverse_dns, results)
+    results = run_with_spinner("Checking Tor exit nodes...", enrich_records_with_tor_signal, results)
     results = sort_results(results, parsed_input.counts)
 
     print_step(
-        5,
+        6,
         workflow_preset.step_total,
         "Review results and export",
         "Core results come first, then profile-driven enrichments and exports.",
