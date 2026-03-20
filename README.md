@@ -1,65 +1,24 @@
-IP Scanner
+# IP Scanner
 
-This is a terminal IP review tool for mixed IPv4 and IPv6 input.
+`IP Scanner` is a terminal-first review tool for working through batches of IPv4 and IPv6 addresses without bouncing between websites, whois tabs, and one-off commands.
 
-It takes a list of IPs, looks up location and provider details, adds a few lightweight enrichments, builds a simple suspicion score, and renders the results in a readable terminal layout.
-
-The script is meant to stay practical. It is not trying to replace proper threat intel, full attribution work, or deep network analysis. It is a fast review aid that helps sort and inspect IPs without leaving the terminal.
+It takes a list of IPs, runs a public lookup pass, adds lightweight enrichment, scores the results, and lays everything out in a way that is meant to be fast to read in a terminal. It is not trying to be a full forensic platform. The goal is simpler than that: make triage and manual review less annoying.
 
 ## What It Does
 
-- Accepts IPv4, IPv6, or mixed input from paste mode or a text file
-- Validates and normalizes IPs with Python's `ipaddress` module
-- Deduplicates repeated IPs and counts total hits
-- Looks up geolocation and provider data with the `ip-api.com` batch endpoint
-- Adds reverse DNS where available
-- Checks whether an IP is listed as a known Tor exit node
-- Builds a simple suspicion score from returned flags and provider clues
-- Sorts results so the riskiest-looking entries show first
-- Shows compact summaries and optional detailed per-IP results
-- Exports results to CSV and JSON
+- accepts IPv4, IPv6, or mixed input
+- supports paste mode and file input
+- normalizes and deduplicates addresses
+- keeps hit counts for repeated IPs
+- batches lookups through `ip-api.com`
+- adds reverse DNS when it is available
+- checks the Tor bulk exit list
+- scores each result using a simple signal model
+- groups repeated patterns like ASN, provider, subnet, and country
+- explains failed public lookups more clearly for private, reserved, link-local, documentation, and similar ranges
+- exports to CSV and JSON
 
-## Current Features
-
-- Single-file script: `ipscanner.py`
-- Terminal-based workflow with boxed menus and colored output
-- Main workflow menu:
-  - `Core Lookup`
-  - `Threat Signals`
-  - `Ownership Intel`
-  - `Full Investigation`
-- Scan profiles:
-  - `Quick scan`
-  - `Standard scan`
-  - `Deep scan`
-  - `Custom options`
-- Paste mode and file input
-- Mixed IPv4 and IPv6 support
-- Reverse DNS enrichment
-- Tor exit node detection
-- Result overview
-- Main lookup table
-- Type summary
-- Country grouping
-- ASN summary
-- Subnet summary
-- Compact detailed results
-- CSV export
-- JSON export
-- Built-in `/help` guide
-
-## Requirements
-
-- Python 3
-- Internet access
-
-External services used:
-
-- `ip-api.com` batch lookup API for geolocation/provider data
-- Tor Project bulk exit list for Tor exit node matching
-- local DNS resolution for reverse DNS lookups
-
-## How To Run
+## Running It
 
 Open a terminal in the project folder and run:
 
@@ -67,56 +26,38 @@ Open a terminal in the project folder and run:
 python ipscanner.py
 ```
 
-## Workflow
+## Requirements
 
-When the script starts, it shows a workflow menu before input selection.
+- Python 3
+- internet access
 
-- `Core Lookup`
-  - Best default path for most checks
-- `Threat Signals`
-  - Same core flow, but aimed at deeper signal review
-- `Ownership Intel`
-  - Workflow shell for later ownership-focused phases
-- `Full Investigation`
-  - Broadest current shell, still built on the same core engine
+The script only uses the Python standard library.
 
-Some later-phase workflows currently route through the existing core lookup flow while keeping the menu structure ready for future additions.
+## Inputs
 
-## Input Options
+You can feed the scanner in two ways:
 
-After the workflow selection, choose how to provide input:
+- paste mode
+- file input
 
-- `Enter`
-  - Paste IPs manually
-- `F`
-  - Load IPs from a file
-- `Q`
-  - Exit
+Paste mode is the quickest option when you are working from logs or copied data. File input is useful when you already have a prepared list.
 
-The script accepts:
+Accepted input includes:
 
 - public IPv4
 - public IPv6
-- private/internal IPs
-- reserved/documentation ranges
+- private and internal addresses
+- reserved and documentation ranges
 - mixed IPv4 and IPv6 in the same run
 
-Private or reserved IPs are still accepted as valid input, but they may fail later during lookup because the remote service cannot resolve public data for them.
+Private or reserved addresses are still accepted on purpose. They usually do not resolve through the public lookup service, but the script now calls out the reason more cleanly instead of just leaving you with a vague failure line.
 
-## Paste Mode
+### Paste Mode Commands
 
-Paste mode is meant for quick manual checks.
-
-Commands:
-
-- `/start`
-  - begin the lookup using the pasted lines
-- `/clear`
-  - clear the current pasted input
-- `/cancel`
-  - return to the previous menu
-- `/help`
-  - show the built-in help guide
+- `/start` starts the scan
+- `/clear` clears the current buffer
+- `/cancel` returns to the previous menu
+- `/help` opens the built-in help screen
 
 Example:
 
@@ -128,119 +69,189 @@ Example:
 /start
 ```
 
-## File Input
+## Workflows
 
-You can also load IPs from a text file.
+The first menu is about posture, not lookup logic. The workflows all use the same core engine underneath, but they push you toward different ways of reviewing the output.
 
-The script reads the file contents, extracts valid IP addresses, normalizes them, deduplicates them, and keeps hit counts for repeated values.
+### Core Lookup
+
+The default path. Best for normal checks when you just want a clean review without too much noise.
+
+### Threat Signals
+
+Leans harder into suspicious infrastructure, repeated ownership, and clustering.
+
+### Ownership Intel
+
+Uses the same engine, but frames the review more around provider and ownership patterns.
+
+### Full Investigation
+
+The broadest current presentation path. If you want the biggest review pass, this is the one.
+
+### Check Intel Updates
+
+Compares your local keyword intel bundle against a remote JSON feed and lets you apply the update from inside the script.
 
 ## Scan Profiles
 
-The current scan profiles control how much review output is shown.
+Profiles change how much the script shows and how it stages the review. They are not just cosmetic themes.
 
-- `Quick scan`
-  - fastest pass with fewer summaries
-- `Standard scan`
-  - recommended default balance
-- `Deep scan`
-  - all available summaries plus detailed records
-- `Custom options`
-  - manual selection of optional sections
+### Quick
 
-## Output
+Made for triage.
 
-A normal run can include these sections:
+- compact results matrix
+- duplicate review when it matters
+- minimal output
+- detailed cards only if you explicitly ask for them
 
-- Input summary
-- Result overview
-- Main lookup results table
-- Type summary
-- Duplicate summary
-- Grouped by country
+### Standard
+
+The best default for most people.
+
+- executive overview cards
+- main results matrix
+- useful summaries without dumping everything
+- optional detailed cards
+
+### Threat Hunter
+
+Built for signal-heavy review.
+
+- high-risk findings section
+- provider repetition
+- ASN clustering
+- subnet clustering
+- country grouping
+- suspicious-only detailed cards
+
+### Analyst
+
+The slow-and-careful profile.
+
+- expanded detail cards
+- clearer narrative layout
+- ownership and provider summaries
+- reverse DNS, Tor state, and reasons shown in a calmer structure
+
+### Insanity
+
+Everything turned on, but still organized.
+
+- executive overview
+- high-risk findings
+- full results matrix
+- provider patterns
+- ASN clustering
+- country grouping
+- subnet clustering
+- duplicate review
+- failed lookup review
+- detailed per-IP intelligence
+- invalid or skipped input section
+
+This is the profile for full visibility. It is intentionally loud, but it should still feel controlled.
+
+### Custom
+
+Manual control over the output sections.
+
+Instead of a long series of yes/no prompts, the script gives you a checklist-style selection screen so you can toggle sections on and off before the scan starts.
+
+## What You See In The Output
+
+Depending on the selected profile, a run can include:
+
+- validation summary
+- executive overview cards
+- high-risk findings
+- full results matrix
+- type distribution
+- provider summary
 - ASN summary
-- Subnet summary
-- Detailed results
-- Invalid/skipped entries
+- country grouping
+- subnet summary
+- duplicate hit review
+- failed lookup review
+- detailed intelligence cards
+- invalid or skipped entries
 
-Some sections are intentionally hidden when they add no value, for example:
+Not every section appears on every run. Empty sections stay hidden so the output does not fill up with dead space.
 
-- duplicate summary when there are no duplicates
-- grouped country view when there are no meaningful groupings
-- ASN or subnet summaries when there are no repeated clusters
+## Signals And Scoring
 
-## Reverse DNS
+The score is a sorting aid, not a verdict.
 
-Reverse DNS is handled as a separate enrichment step after the main lookup.
+It uses a mix of:
 
-- Works for IPv4 and IPv6 where PTR records exist
-- Failure does not stop the scan
-- Missing PTR records are handled cleanly
-- Detailed results show reverse DNS when there is a useful hostname
-- Export includes reverse DNS fields
+- `hosting`
+- `proxy`
+- `mobile`
+- Tor exit matches
+- provider and ASN keyword hits
+- a few extra consistency clues from provider text
 
-## Tor Exit Detection
+Current score bands:
 
-Tor detection is handled as a separate threat signal.
+- `VERY HIGH`: 9+
+- `HIGH`: 6 to 8
+- `MEDIUM`: 3 to 5
+- `LOW`: 1 to 2
+- `NONE`: 0 or below
 
-- The script fetches the Tor Project bulk exit list once per run
-- Each IP is checked against that list
-- Tor results are normalized on the internal record
-- Tor evidence is shown in detailed results when relevant
-- Tor data is included in export output
+That score helps push the more suspicious-looking entries toward the top of the screen. It should not be treated as proof that an IP is malicious, residential, or a VPN exit.
 
-## Notes About The Score
+## Reverse DNS And Tor Checks
 
-The suspicion score is a rough review signal, not a final verdict.
+Reverse DNS is handled as a separate enrichment pass after the main lookup. It works for both IPv4 and IPv6 where PTR data exists.
 
-It currently uses a mix of:
+Tor detection is also a separate pass. The script fetches the Tor Project bulk exit list during the run, checks each IP against it, and carries that result into the output and exports.
 
-- hosting flag
-- proxy flag
-- mobile flag
-- Tor exit match
-- provider/network keyword matches
-- ASN-related hints
-- a few provider-text consistency clues
+## Failed Lookup Diagnostics
 
-Current broad scoring bands:
+When a public lookup fails, the script does more than repeat the remote error message.
 
-- `VERY HIGH`
-  - 9 or more
-- `HIGH`
-  - 6 to 8
-- `MEDIUM`
-  - 3 to 5
-- `LOW`
-  - 1 to 2
-- `NONE`
-  - 0 or less
+It now tries to classify the address locally and explain what kind of range it belongs to. That includes things like:
 
-The score is meant to help sort and review results quickly. It should not be treated as proof that an IP is malicious, residential, VPN, or benign.
+- RFC1918 private IPv4
+- unique local IPv6
+- link-local IPv4 or IPv6
+- loopback ranges
+- documentation ranges
+- benchmark and reserved ranges
 
-## Built-In Help
+That makes failed results much easier to understand when you are working with internal logs or mixed address sets.
 
-You can type `/help` at interactive prompts to reopen the built-in guide.
+## Intel Updates
 
-The help screen explains:
+The keyword-based scoring bundle lives in `ipscanner_intel.json`.
 
-- how the scan flow works
-- what the score points are based on
-- what each workflow means
-- what each scan profile does
+At startup, the script loads that file and uses it to drive parts of the scoring logic. From the main menu, `Check Intel Updates` compares the local copy with a remote JSON feed and can write the newer version back to disk.
+
+Default remote feed:
+
+- `https://raw.githubusercontent.com/UnnMatt/IPscanner/main/ipscanner_intel.json`
+
+You can override that URL with:
+
+- `IPSCANNER_INTEL_URL`
+
+This updater is only for the intel bundle. It does not update the Python script itself.
 
 ## Exports
 
 At the end of a run, the script can save:
 
-- CSV output
-- JSON output
+- CSV
+- JSON
 
 Default filenames:
 
 - `ip_results.csv`
 - `ip_results.json`
 
-Current export data includes the core lookup result plus normalized fields such as:
+Exports include the main lookup result plus the normalized review fields the script adds, such as:
 
 - hit count
 - type classification
@@ -248,42 +259,32 @@ Current export data includes the core lookup result plus normalized fields such 
 - suspicion score
 - score reasons
 - Tor state
-- reverse DNS fields
+- reverse DNS
+- failed lookup diagnostics
+
+## External Services
+
+The script currently relies on:
+
+- `ip-api.com` for batch IP lookup
+- the Tor Project bulk exit list
+- local DNS resolution for reverse DNS
 
 ## Limits
 
-This tool depends on remote and network-derived data.
+This tool is only as clean as the data it can pull in.
 
-That means:
+Keep in mind:
 
-- missing or incorrect provider data can change the result
-- reverse DNS may be missing, stale, generic, or misleading
-- some public resolvers and CDN infrastructure may look suspicious because they are hosted infrastructure
-- private and reserved IPs will often fail lookup cleanly
-- Tor list membership changes over time
-- the score should always be read as a hint, not a final answer
+- provider labels can be incomplete or misleading
+- reverse DNS can be stale, generic, or missing
+- hosted infrastructure can look suspicious even when it is normal
+- private and reserved ranges will not behave like public IPs
+- Tor membership changes over time
+- keyword scoring is useful for sorting, not final attribution
 
-## Example Use Cases
+## Why It Is Still One File
 
-- reviewing login IPs
-- checking mixed address lists from logs
-- sorting repeated addresses before manual review
-- getting a quick location, ASN, and provider overview
-- spotting infrastructure-heavy results faster
+This project is intentionally kept simple.
 
-## Project Note
-
-This project is intentionally kept as a single terminal script.
-
-The goal is:
-
-- readable output
-- familiar workflow
-- quick review
-- clean internal structure for future additions
-
-It is not designed to be a full forensic suite. It focuses on staying practical and easy to run with:
-
-```bash
-python ipscanner.py
-```
+It stays in a single script because the point is to have something easy to run, easy to tweak, and easy to carry around. The UI has grown quite a bit, but the tool is still meant to feel practical rather than overbuilt.

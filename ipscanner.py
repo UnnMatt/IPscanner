@@ -21,6 +21,9 @@ FIELDS = (
     "isp,org,as,asname,hosting,proxy,mobile"
 )
 TOR_EXIT_LIST_URL = "https://check.torproject.org/torbulkexitlist"
+INTEL_DATA_FILE = "ipscanner_intel.json"
+DEFAULT_INTEL_UPDATE_URL = "https://raw.githubusercontent.com/UnnMatt/IPscanner/main/ipscanner_intel.json"
+INTEL_UPDATE_URL_ENV = "IPSCANNER_INTEL_URL"
 
 # ==================================================
 # Theme And Display Constants
@@ -122,6 +125,84 @@ def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
 
+def ui_width(limit=112, minimum=48):
+    return max(minimum, min(terminal_width(), limit))
+
+
+def tone_color(tone):
+    return tone or ACCENT
+
+
+def badge(text, tone=ACCENT):
+    label = str(text).strip().upper()
+    return color(f"[{label}]", BOLD + tone_color(tone))
+
+
+def muted(text):
+    return color(text, DIM + MUTED)
+
+
+def print_notice(text, tone=ACCENT):
+    print(color(f"> {text}", tone))
+
+
+def print_rule(char="-", tone=MUTED, width=None):
+    print(color(char * (width or ui_width()), DIM + tone))
+
+
+def card_block(title, value, note="", tone=ACCENT, width=24):
+    title_text = safe(str(title).upper(), width - 4)
+    value_text = safe(str(value), width - 4)
+    note_text = safe(str(note), width - 4) if note else ""
+    top = color("." + ("-" * (width - 2)) + ".", tone)
+    bottom = color("'" + ("-" * (width - 2)) + "'", tone)
+    lines = [
+        top,
+        f"{color('|', tone)} {pad_text(color(title_text, DIM + MUTED), width - 4)} {color('|', tone)}",
+        f"{color('|', tone)} {pad_text(color(value_text, BOLD + tone), width - 4)} {color('|', tone)}",
+        f"{color('|', tone)} {pad_text(note_text, width - 4)} {color('|', tone)}",
+        bottom,
+    ]
+    return lines
+
+
+def print_stat_cards(cards, preferred_width=24, gap=2):
+    if not cards:
+        return
+
+    available = ui_width()
+    per_row = max(1, available // (preferred_width + gap))
+    per_row = min(per_row, 4)
+
+    for start in range(0, len(cards), per_row):
+        chunk = cards[start:start + per_row]
+        rendered = [card_block(*card, width=preferred_width) for card in chunk]
+        for row in zip(*rendered):
+            print((" " * gap).join(row))
+        print()
+
+
+def print_option_panel(index, title, badge_text, summary, detail="", note="", tone=PRIMARY, width=None):
+    lines = [
+        f"{badge(str(index), tone)} {color(title, BOLD + tone)}  {badge(badge_text, tone)}",
+        summary,
+    ]
+    if detail:
+        lines.append(muted(detail))
+    if note:
+        lines.append(color(note, DIM + WARNING))
+    print_box(title, lines, tone=tone, width=width or min(ui_width(), 96))
+
+
+def panel_header(title, kicker="", tone=PRIMARY, width=None):
+    width = min(width or ui_width(), 112)
+    kicker_text = f"{kicker} / " if kicker else ""
+    label = f"[ {kicker_text}{title} ]"
+    fill = max(0, width - len(label) - 2)
+    print()
+    print(color(label + ("=" * fill), BOLD + tone))
+
+
 def show_banner():
     clear_screen()
 
@@ -139,6 +220,7 @@ def show_banner():
         print(color(line, BOLD + tone))
     print(color("  IP lookup, location info, and quick risk hints", DIM + MUTED))
     print(color("  Terminal tool with CSV and JSON export", DIM + MUTED))
+    print(color(f"  Intel bundle: {get_active_intel_version()}", DIM + MUTED))
     print(color("  Type /help at prompts for a quick guide", DIM + MUTED))
 
 
@@ -261,19 +343,21 @@ def help_score_lines():
 
 def help_workflow_lines():
     return [
-        "Core Lookup: normal/default scan path.",
-        "Threat Signals: same core flow, but pushes you toward deeper review.",
-        "Ownership Intel: later-phase shell that currently routes through the core flow.",
-        "Full Investigation: broadest current shell, still built on the core flow.",
+        "Core Lookup: balanced day-to-day investigation path with the recommended profile posture.",
+        "Threat Signals: pushes toward clustering, suspicious infrastructure, and risk-heavy review.",
+        "Ownership Intel: routes through the same engine but frames the output for provider and ownership review.",
+        "Full Investigation: widest current visibility path and best entry point for Insanity mode.",
     ]
 
 
 def help_profile_lines():
     return [
-        "Quick scan: fastest pass, fewer summaries.",
-        "Standard scan: recommended balance for normal use.",
-        "Deep scan: all available summaries and detailed records.",
-        "Custom options: choose each optional summary manually.",
+        "Quick: fast triage with a compact matrix and minimal noise.",
+        "Standard: recommended default with balanced summaries and optional detail cards.",
+        "Threat Hunter: clustering-heavy review focused on infrastructure repetition.",
+        "Analyst: expanded intelligence cards for deliberate human review.",
+        "Insanity: every meaningful view enabled in a staged layout.",
+        "Custom: manual section control for expert workflows.",
     ]
 
 
@@ -281,6 +365,7 @@ def help_usage_lines():
     return [
         "Paste mode accepts IPv4, IPv6, or mixed input.",
         "Use /start to begin, /clear to reset pasted input, /cancel to go back.",
+        "Main menu can check for newer keyword intel without editing the script.",
         "Use /help at prompts to reopen this guide.",
         "Main table is the fast overview. Detailed results are for follow-up review.",
     ]
@@ -352,6 +437,191 @@ def run_with_spinner(message, func, *args, **kwargs):
     return state["result"]
 
 
+def show_banner():
+    clear_screen()
+
+    banner_lines = [
+        (PRIMARY, "  ___ ____    ____                                  "),
+        (ACCENT, " |_ _|  _ \\  / ___|  ___ __ _ _ __  _ __   ___ _ __ "),
+        (ACCENT, "  | || |_) | \\___ \\ / __/ _` | '_ \\| '_ \\ / _ \\ '__|"),
+        (CYAN, "  | ||  __/   ___) | (_| (_| | | | | | | |  __/ |   "),
+        (BLUE, " |___|_|     |____/ \\___\\__,_|_| |_|_| |_|\\___|_|   "),
+    ]
+
+    width = min(ui_width(), 110)
+    top = "." + ("=" * (width - 2)) + "."
+    bottom = "'" + ("=" * (width - 2)) + "'"
+
+    print()
+    print(color(top, PRIMARY))
+    for tone, line in banner_lines:
+        print(color(pad_text(line, width - 4, "center"), BOLD + tone))
+    print(color("-" * (width - 2), DIM + MUTED))
+    print(color("  Analyst-grade IP investigation console", BOLD + ACCENT))
+    print(color("  Geolocation, enrichment, clustering, export, and live intel review", DIM + MUTED))
+    print(
+        f"  {badge('LIVE INTEL', SUCCESS)} {muted(f'Bundle {get_active_intel_version()}')}"
+        f"   {badge('HELP', PRIMARY)} {muted('Type /help at prompts')}"
+    )
+    print(color(bottom, PRIMARY))
+
+
+def header(text, subtitle=None):
+    width = ui_width()
+    label = f"  {text.upper()}  "
+    fill = max(0, width - len(label))
+    print()
+    print(color(label + ("=" * fill), BOLD + PRIMARY))
+    if subtitle:
+        print(color(subtitle, DIM + MUTED))
+    print(color("-" * width, DIM + MUTED))
+
+
+def print_step(step, total, title, detail=None):
+    panel_header(title.upper(), kicker=f"STEP {step}/{total}", tone=ACCENT, width=ui_width())
+    if detail:
+        print(color(detail, DIM + MUTED))
+
+
+def print_box(title, lines, tone=ACCENT, width=None):
+    full_width = min(width or ui_width(), 104)
+    full_width = max(full_width, len(title) + 8)
+    label = f"[ {title} ]"
+    top_fill = max(0, full_width - len(label) - 3)
+
+    print(color(".-" + label + ("-" * top_fill) + ".", tone))
+    for line in lines:
+        content = line if line is not None else ""
+        padding = max(0, full_width - visible_len(content) - 4)
+        print(f"{color('|', tone)} {content}{' ' * padding} {color('|', tone)}")
+    print(color("'" + ("-" * (full_width - 2)) + "'", tone))
+
+
+def render_table(columns, rows, tone=PRIMARY):
+    widths = [column["width"] for column in columns]
+    aligns = [column.get("align", "left") for column in columns]
+    headers = [column["title"] for column in columns]
+
+    print(color(build_table_border(".", "+", ".", widths), tone))
+    print(color(format_table_row(headers, widths, ["center"] * len(columns)), BOLD + tone))
+    print(color(build_table_border("+", "+", "+", widths), DIM + tone))
+    for row in rows:
+        print(format_table_row(row, widths, aligns))
+    print(color(build_table_border("'", "+", "'", widths), tone))
+
+
+def show_help():
+    width = min(ui_width(), 108)
+    header("HELP CONSOLE", "Reference guide for workflows, profiles, scoring, input, and export behavior.")
+    print_box("Workflow Guide", help_workflow_lines(), tone=PRIMARY, width=width)
+    print_box("Profile Guide", help_profile_lines(), tone=ACCENT, width=width)
+    print_box("Risk Score Guide", help_score_lines(), tone=PRIMARY, width=width)
+    print_box(
+        "Input Commands",
+        [
+            "Paste mode: /start begins the scan, /clear resets, /cancel returns, /help reopens this guide.",
+            "File mode: point at any text file and the scanner will extract valid IPv4 and IPv6 tokens.",
+        ],
+        tone=ACCENT,
+        width=width,
+    )
+    print_box(
+        "Export Notes",
+        [
+            "CSV and JSON exports preserve the core lookup, normalized flags, Tor state, reverse DNS, and failure diagnostics.",
+            "Intel updates refresh the keyword bundle only. They do not replace the Python script itself.",
+        ],
+        tone=PRIMARY,
+        width=width,
+    )
+    print_box(
+        "Quick Tips",
+        [
+            "Quick is for triage, Standard is the best default, Threat Hunter leans into clustering, Analyst leans into detailed cards, and Insanity shows the full matrix.",
+            "Private, reserved, and local-only addresses are accepted as input but explained separately when public lookup services cannot resolve them.",
+        ],
+        tone=ACCENT,
+        width=width,
+    )
+
+
+def prompt(text):
+    while True:
+        value = input(color(f"{text}  > ", BOLD + ACCENT)).strip()
+        if value.lower() == "/help":
+            show_help()
+            continue
+        return value
+
+
+def ask_yes_no(question, default="n"):
+    suffix = "Y/n" if default.lower() == "y" else "y/N"
+    while True:
+        choice = prompt(f"{question} [{suffix}]").lower()
+        if not choice:
+            return default.lower() == "y"
+        if choice in {"y", "yes"}:
+            return True
+        if choice in {"n", "no"}:
+            return False
+        print_notice("Use y or n.", WARNING)
+
+
+def run_with_spinner(message, func, *args, **kwargs):
+    state = {"result": None, "error": None}
+    finished = threading.Event()
+
+    def worker():
+        try:
+            state["result"] = func(*args, **kwargs)
+        except Exception as exc:
+            state["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    frames = itertools.cycle(["[=    ]", "[==   ]", "[===  ]", "[ === ]", "[  ===]", "[   ==]", "[    =]"])
+    label = f"{message} "
+
+    while not finished.wait(0.1):
+        frame = next(frames)
+        sys.stdout.write("\r" + color(f"{frame} {label}", BOLD + ACCENT))
+        sys.stdout.flush()
+
+    clear_width = len(label) + 12
+    sys.stdout.write("\r" + (" " * clear_width) + "\r")
+    sys.stdout.flush()
+    thread.join()
+
+    if state["error"] is not None:
+        raise state["error"]
+
+    print(color(f"[done] {message}", DIM + MUTED))
+    return state["result"]
+
+
+def get_intel_file_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), INTEL_DATA_FILE)
+
+
+def get_intel_update_url():
+    return os.getenv(INTEL_UPDATE_URL_ENV, DEFAULT_INTEL_UPDATE_URL).strip()
+
+
+def get_active_intel_version():
+    return INTEL_CONFIG.get("intel_version", "built-in")
+
+
+def get_active_intel_updated_at():
+    return INTEL_CONFIG.get("updated_at", "")
+
+
+def get_active_intel_source():
+    return INTEL_CONFIG.get("source", "bundled defaults")
+
+
 # ==================================================
 # Internal Data Models And Workflow Hooks
 # ==================================================
@@ -376,7 +646,18 @@ class ScanProfile:
     key: str
     name: str
     description: str
+    badge: str = ""
+    purpose: str = ""
     enabled: set = field(default_factory=set)
+    section_order: list = field(default_factory=list)
+    overview_metrics: list = field(default_factory=list)
+    table_mode: str = "standard"
+    detail_mode: str = "prompt"
+    detail_prompt_default: str = "n"
+    show_high_risk_findings: bool = False
+    show_failed_lookup_review: bool = False
+    show_invalid_entries: bool = True
+    show_profile_preamble: bool = True
     prompt_for_details: bool = False
 
     def runtime_copy(self):
@@ -384,7 +665,18 @@ class ScanProfile:
             key=self.key,
             name=self.name,
             description=self.description,
+            badge=self.badge,
+            purpose=self.purpose,
             enabled=set(self.enabled),
+            section_order=list(self.section_order),
+            overview_metrics=list(self.overview_metrics),
+            table_mode=self.table_mode,
+            detail_mode=self.detail_mode,
+            detail_prompt_default=self.detail_prompt_default,
+            show_high_risk_findings=self.show_high_risk_findings,
+            show_failed_lookup_review=self.show_failed_lookup_review,
+            show_invalid_entries=self.show_invalid_entries,
+            show_profile_preamble=self.show_profile_preamble,
             prompt_for_details=self.prompt_for_details,
         )
 
@@ -398,8 +690,16 @@ class WorkflowPreset:
     name: str
     description: str
     default_profile_key: str
+    badge: str = ""
     step_total: int = 6
     availability_note: str = ""
+
+
+@dataclass
+class IntelDiff:
+    added: list = field(default_factory=list)
+    removed: list = field(default_factory=list)
+    changed: list = field(default_factory=list)
 
 
 @dataclass
@@ -408,6 +708,9 @@ class IPResultRecord:
     count: int = 1
     status: str = ""
     message: str = ""
+    failure_category: str = ""
+    failure_range: str = ""
+    failure_detail: str = ""
     country: str = ""
     countryCode: str = ""
     regionName: str = ""
@@ -458,6 +761,9 @@ class IPResultRecord:
         return {
             "status": self.status,
             "message": self.message,
+            "failure_category": self.failure_category,
+            "failure_range": self.failure_range,
+            "failure_detail": self.failure_detail,
             "query": self.query,
             "country": self.country,
             "countryCode": self.countryCode,
@@ -492,7 +798,7 @@ class IPResultRecord:
 
 
 # Strong indicators
-HARD_KEYWORDS = {
+DEFAULT_HARD_KEYWORDS = {
     "vpn": 4,
     "proxy": 4,
     "tor": 5,
@@ -616,7 +922,7 @@ HARD_KEYWORDS = {
 }
 
 # Softer indicators
-SOFT_KEYWORDS = {
+DEFAULT_SOFT_KEYWORDS = {
     "virtual": 1,
     "compute": 1,
     "bare metal": 2,
@@ -636,7 +942,7 @@ SOFT_KEYWORDS = {
 }
 
 # Hints that it may be normal consumer/mobile internet
-RESIDENTIAL_HINTS = {
+DEFAULT_RESIDENTIAL_HINTS = {
     "telia": -2,
     "tele2": -2,
     "telenor": -2,
@@ -681,6 +987,285 @@ RESIDENTIAL_HINTS = {
     "wireless": -1,
 }
 
+DEFAULT_HOSTING_LIKE_TERMS = [
+    "hosting",
+    "cloud",
+    "server",
+    "datacenter",
+    "data center",
+    "vps",
+    "colo",
+    "colocation",
+    "proxy",
+    "vpn",
+]
+
+HARD_KEYWORDS = dict(DEFAULT_HARD_KEYWORDS)
+SOFT_KEYWORDS = dict(DEFAULT_SOFT_KEYWORDS)
+RESIDENTIAL_HINTS = dict(DEFAULT_RESIDENTIAL_HINTS)
+HOSTING_LIKE_TERMS = list(DEFAULT_HOSTING_LIKE_TERMS)
+INTEL_CONFIG = {}
+INTEL_LOAD_WARNING = ""
+
+
+def build_default_intel_config():
+    return {
+        "schema_version": 1,
+        "intel_version": "bundled-defaults",
+        "updated_at": "",
+        "source": "bundled defaults",
+        "notes": "Built-in keyword data bundled with the script.",
+        "hard_keywords": dict(DEFAULT_HARD_KEYWORDS),
+        "soft_keywords": dict(DEFAULT_SOFT_KEYWORDS),
+        "residential_hints": dict(DEFAULT_RESIDENTIAL_HINTS),
+        "hosting_like_terms": list(DEFAULT_HOSTING_LIKE_TERMS),
+    }
+
+
+def normalize_intel_mapping(field_name, mapping):
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{field_name} must be a JSON object.")
+
+    normalized = {}
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{field_name} keys must be strings.")
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field_name} values must be integers.")
+
+        normalized_key = normalize_text(key)
+        if normalized_key:
+            normalized[normalized_key] = int(value)
+
+    return dict(sorted(normalized.items()))
+
+
+def normalize_intel_terms(field_name, values):
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ValueError(f"{field_name} must be a JSON array.")
+
+    normalized = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} entries must be strings.")
+        normalized_value = normalize_text(value)
+        if normalized_value and normalized_value not in seen:
+            normalized.append(normalized_value)
+            seen.add(normalized_value)
+
+    return normalized
+
+
+def normalize_intel_config(payload, source_label):
+    if not isinstance(payload, dict):
+        raise ValueError("Intel payload must be a JSON object.")
+
+    defaults = build_default_intel_config()
+    schema_version = payload.get("schema_version", defaults["schema_version"])
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version < 1:
+        raise ValueError("schema_version must be a positive integer.")
+
+    intel_version = str(payload.get("intel_version", defaults["intel_version"])).strip() or defaults["intel_version"]
+    updated_at = str(payload.get("updated_at", defaults["updated_at"])).strip()
+    source = str(payload.get("source", source_label)).strip() or source_label
+    notes = str(payload.get("notes", defaults["notes"])).strip()
+
+    return {
+        "schema_version": schema_version,
+        "intel_version": intel_version,
+        "updated_at": updated_at,
+        "source": source,
+        "notes": notes,
+        "hard_keywords": normalize_intel_mapping("hard_keywords", payload.get("hard_keywords", defaults["hard_keywords"])),
+        "soft_keywords": normalize_intel_mapping("soft_keywords", payload.get("soft_keywords", defaults["soft_keywords"])),
+        "residential_hints": normalize_intel_mapping("residential_hints", payload.get("residential_hints", defaults["residential_hints"])),
+        "hosting_like_terms": normalize_intel_terms("hosting_like_terms", payload.get("hosting_like_terms", defaults["hosting_like_terms"])),
+    }
+
+
+def load_intel_config_from_file(path=None):
+    path = path or get_intel_file_path()
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return normalize_intel_config(payload, path)
+
+
+def fetch_json_url(url, timeout=10.0):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "IPScanner Intel Updater/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_remote_intel_config(url=None, timeout=10.0):
+    url = (url or get_intel_update_url()).strip()
+    if not url:
+        raise ValueError(
+            f"No intel update URL configured. Set {INTEL_UPDATE_URL_ENV} or update the default URL."
+        )
+    payload = fetch_json_url(url, timeout=timeout)
+    return normalize_intel_config(payload, url)
+
+
+def save_intel_config(config, path=None):
+    path = path or get_intel_file_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def apply_runtime_intel_config(config):
+    global HARD_KEYWORDS, SOFT_KEYWORDS, RESIDENTIAL_HINTS, HOSTING_LIKE_TERMS, INTEL_CONFIG
+
+    HARD_KEYWORDS = dict(config["hard_keywords"])
+    SOFT_KEYWORDS = dict(config["soft_keywords"])
+    RESIDENTIAL_HINTS = dict(config["residential_hints"])
+    HOSTING_LIKE_TERMS = list(config["hosting_like_terms"])
+    INTEL_CONFIG = dict(config)
+
+
+def initialize_runtime_intel():
+    global INTEL_LOAD_WARNING
+
+    try:
+        config = load_intel_config_from_file()
+        INTEL_LOAD_WARNING = ""
+    except FileNotFoundError:
+        config = build_default_intel_config()
+        INTEL_LOAD_WARNING = f"{INTEL_DATA_FILE} not found. Using bundled defaults."
+    except Exception as exc:
+        config = build_default_intel_config()
+        INTEL_LOAD_WARNING = f"Failed to load {INTEL_DATA_FILE}: {exc}. Using bundled defaults."
+
+    apply_runtime_intel_config(config)
+
+
+def compare_intel_mapping(local_mapping, remote_mapping):
+    local_keys = set(local_mapping)
+    remote_keys = set(remote_mapping)
+
+    added = sorted(remote_keys - local_keys)
+    removed = sorted(local_keys - remote_keys)
+    changed = sorted(key for key in (local_keys & remote_keys) if local_mapping[key] != remote_mapping[key])
+    return IntelDiff(added=added, removed=removed, changed=changed)
+
+
+def compare_intel_terms(local_values, remote_values):
+    local_set = set(local_values)
+    remote_set = set(remote_values)
+    return IntelDiff(
+        added=sorted(remote_set - local_set),
+        removed=sorted(local_set - remote_set),
+        changed=[],
+    )
+
+
+def diff_count_text(diff):
+    return f"+{len(diff.added)} / -{len(diff.removed)} / Δ{len(diff.changed)}"
+
+
+def preview_diff_items(diff, limit=3):
+    parts = []
+    if diff.added:
+        parts.append(f"add: {', '.join(diff.added[:limit])}")
+    if diff.changed:
+        parts.append(f"chg: {', '.join(diff.changed[:limit])}")
+    if diff.removed:
+        parts.append(f"del: {', '.join(diff.removed[:limit])}")
+    return " | ".join(parts)
+
+
+def configs_are_equal(local_config, remote_config):
+    return local_config == remote_config
+
+
+def print_intel_status_box(title, config, tone=ACCENT):
+    lines = [
+        f"{color('Version', DIM + MUTED)} : {color(config.get('intel_version', 'unknown'), BOLD + ACCENT)}",
+        f"{color('Updated', DIM + MUTED)} : {config.get('updated_at', 'N/A') or 'N/A'}",
+        f"{color('Source', DIM + MUTED)} : {config.get('source', 'unknown')}",
+    ]
+    if config.get("notes"):
+        lines.append(f"{color('Notes', DIM + MUTED)} : {config['notes']}")
+    print_box(title, lines, tone=tone, width=min(terminal_width(), 110))
+
+
+def run_intel_update_check():
+    header("INTEL UPDATES", "Compare local keyword intel with the remote feed and optionally apply it.")
+    local_config = dict(INTEL_CONFIG) if INTEL_CONFIG else build_default_intel_config()
+    remote_url = get_intel_update_url()
+
+    print_intel_status_box("Current Intel", local_config, tone=ACCENT)
+    print_box(
+        "Remote Feed",
+        [
+            f"{color('URL', DIM + MUTED)} : {remote_url}",
+            f"{color('Override', DIM + MUTED)} : Set {INTEL_UPDATE_URL_ENV} to use a different JSON feed.",
+        ],
+        tone=PRIMARY,
+        width=min(terminal_width(), 110),
+    )
+
+    try:
+        remote_config = run_with_spinner("Checking remote intel feed...", fetch_remote_intel_config, remote_url)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            print(color("Remote intel feed was not found. Push ipscanner_intel.json to the repo or set IPSCANNER_INTEL_URL.", WARNING))
+            return
+        print(color(f"Remote intel check failed: HTTP {exc.code} {exc.reason}", DANGER))
+        return
+    except urllib.error.URLError as exc:
+        print(color(f"Remote intel check failed: {exc.reason}", DANGER))
+        return
+    except Exception as exc:
+        print(color(f"Remote intel check failed: {exc}", DANGER))
+        return
+
+    print_intel_status_box("Remote Intel", remote_config, tone=SUCCESS)
+
+    if configs_are_equal(local_config, remote_config):
+        print(color("No intel changes found. Your local keyword pack is already current.", SUCCESS))
+        return
+
+    hard_diff = compare_intel_mapping(local_config["hard_keywords"], remote_config["hard_keywords"])
+    soft_diff = compare_intel_mapping(local_config["soft_keywords"], remote_config["soft_keywords"])
+    residential_diff = compare_intel_mapping(local_config["residential_hints"], remote_config["residential_hints"])
+    hosting_diff = compare_intel_terms(local_config["hosting_like_terms"], remote_config["hosting_like_terms"])
+
+    lines = [
+        f"{color('Hard keywords', DIM + MUTED)} : {diff_count_text(hard_diff)}",
+        f"{color('Soft keywords', DIM + MUTED)} : {diff_count_text(soft_diff)}",
+        f"{color('Residential', DIM + MUTED)} : {diff_count_text(residential_diff)}",
+        f"{color('Hosting terms', DIM + MUTED)} : {diff_count_text(hosting_diff)}",
+    ]
+
+    previews = [
+        preview_diff_items(hard_diff),
+        preview_diff_items(soft_diff),
+        preview_diff_items(residential_diff),
+        preview_diff_items(hosting_diff),
+    ]
+    preview_text = next((item for item in previews if item), "")
+    if preview_text:
+        lines.append(f"{color('Preview', DIM + MUTED)} : {preview_text}")
+
+    print_box("Detected Changes", lines, tone=SUCCESS, width=min(terminal_width(), 110))
+
+    if not ask_yes_no("Apply this intel update now?", default="y"):
+        print(color("Intel update skipped. Local keyword data was left unchanged.", WARNING))
+        return
+
+    save_intel_config(remote_config)
+    apply_runtime_intel_config(remote_config)
+    print(color(f"Intel updated to {get_active_intel_version()} and saved to {INTEL_DATA_FILE}.", SUCCESS))
+
 OPTIONAL_ENRICHMENTS = [
     EnrichmentOption(
         key="type_summary",
@@ -698,6 +1283,11 @@ OPTIONAL_ENRICHMENTS = [
         description="Country buckets for quick location review.",
     ),
     EnrichmentOption(
+        key="provider_summary",
+        label="Provider summary",
+        description="Repeated provider and organization patterns.",
+    ),
+    EnrichmentOption(
         key="asn_summary",
         label="ASN summary",
         description="Top networks by unique IP count and total hits.",
@@ -712,29 +1302,82 @@ OPTIONAL_ENRICHMENTS = [
         label="Detailed results",
         description="Expanded per-IP geolocation and provider view.",
     ),
+    EnrichmentOption(
+        key="failed_lookup_summary",
+        label="Failed lookup review",
+        description="Grouped diagnostics for addresses that could not resolve public data.",
+    ),
 ]
 
 SCAN_PROFILES = {
     "quick": ScanProfile(
         key="quick",
-        name="Quick scan",
-        description="Fastest first pass.",
-        enabled={"type_summary", "duplicates"},
-        prompt_for_details=False,
+        name="Quick",
+        description="Fast triage pass for large pasted lists.",
+        badge="FAST",
+        purpose="Minimal output with compact results and just enough clustering to spot repetition.",
+        enabled={"duplicates"},
+        section_order=["duplicates"],
+        overview_metrics=["total_unique", "total_hits", "successful", "failed", "high_risk"],
+        table_mode="compact",
+        detail_mode="prompt",
+        detail_prompt_default="n",
     ),
     "standard": ScanProfile(
         key="standard",
-        name="Standard scan",
-        description="Best default balance.",
-        enabled={"type_summary", "duplicates", "country_grouping", "asn_summary", "subnet_summary"},
-        prompt_for_details=True,
+        name="Standard",
+        description="Best all-around review mode.",
+        badge="RECOMMENDED",
+        purpose="Balanced output with overview cards, the main results matrix, and the most useful summaries.",
+        enabled={"type_summary", "duplicates", "country_grouping", "asn_summary"},
+        section_order=["type_summary", "duplicates", "country_grouping", "asn_summary"],
+        overview_metrics=["total_unique", "total_hits", "successful", "failed", "high_risk", "tor_flagged", "country_count", "top_asn"],
+        table_mode="standard",
+        detail_mode="prompt",
+        detail_prompt_default="n",
+        show_high_risk_findings=True,
     ),
-    "deep": ScanProfile(
-        key="deep",
-        name="Deep scan",
-        description="All available summaries and details.",
+    "threat_hunter": ScanProfile(
+        key="threat_hunter",
+        name="Threat Hunter",
+        description="Signal-focused review for suspicious infrastructure and clustering.",
+        badge="DEEP",
+        purpose="Prioritizes repeated infrastructure, ASN concentration, subnet overlap, provider repetition, and suspicious findings.",
+        enabled={"type_summary", "duplicates", "country_grouping", "provider_summary", "asn_summary", "subnet_summary", "failed_lookup_summary"},
+        section_order=["provider_summary", "asn_summary", "subnet_summary", "country_grouping", "duplicates", "failed_lookup_summary", "type_summary"],
+        overview_metrics=["total_unique", "high_risk", "tor_flagged", "proxy_flagged", "hosting_flagged", "country_count", "top_asn", "top_subnet"],
+        table_mode="standard",
+        detail_mode="suspicious",
+        show_high_risk_findings=True,
+        show_failed_lookup_review=True,
+    ),
+    "analyst": ScanProfile(
+        key="analyst",
+        name="Analyst",
+        description="Structured deep dive for human review.",
+        badge="REVIEW",
+        purpose="Expanded intelligence cards with clearer narratives around risk, ownership, reverse DNS, and failed lookups.",
+        enabled={"type_summary", "duplicates", "country_grouping", "provider_summary", "asn_summary", "detailed_results", "failed_lookup_summary"},
+        section_order=["type_summary", "provider_summary", "asn_summary", "country_grouping", "duplicates", "failed_lookup_summary", "detailed_results"],
+        overview_metrics=["total_unique", "successful", "failed", "high_risk", "tor_flagged", "proxy_flagged", "hosting_flagged", "top_asn"],
+        table_mode="expanded",
+        detail_mode="all",
+        show_high_risk_findings=True,
+        show_failed_lookup_review=True,
+    ),
+    "insanity": ScanProfile(
+        key="insanity",
+        name="Insanity",
+        description="Maximum visibility mode with every meaningful section enabled.",
+        badge="MAX",
+        purpose="Shows the full matrix, all clustering views, all details, and all failure diagnostics in a controlled staged layout.",
         enabled={item.key for item in OPTIONAL_ENRICHMENTS},
-        prompt_for_details=False,
+        section_order=["type_summary", "provider_summary", "asn_summary", "country_grouping", "subnet_summary", "duplicates", "failed_lookup_summary", "detailed_results"],
+        overview_metrics=["total_unique", "total_hits", "successful", "failed", "high_risk", "tor_flagged", "proxy_flagged", "hosting_flagged", "country_count", "top_asn", "top_subnet"],
+        table_mode="expanded",
+        detail_mode="all",
+        show_high_risk_findings=True,
+        show_failed_lookup_review=True,
     ),
 }
 
@@ -752,26 +1395,30 @@ WORKFLOW_PRESETS = {
         name="Core Lookup",
         description="Best for most checks.",
         default_profile_key="standard",
+        badge="RECOMMENDED",
     ),
     "threat_signals": WorkflowPreset(
         key="threat_signals",
         name="Threat Signals",
-        description="Stronger signal-focused review.",
-        default_profile_key="deep",
+        description="Suspicious infrastructure and clustering review.",
+        default_profile_key="threat_hunter",
+        badge="DEEP",
     ),
     "ownership_intel": WorkflowPreset(
         key="ownership_intel",
         name="Ownership Intel",
-        description="Ownership-oriented path.",
-        default_profile_key="standard",
-        availability_note="Later phase. Uses the core lookup flow for now.",
+        description="Ownership-oriented deep review.",
+        default_profile_key="analyst",
+        badge="ADVANCED",
+        availability_note="Uses the current core engine, but presents results in a more ownership-review oriented lens.",
     ),
     "full_investigation": WorkflowPreset(
         key="full_investigation",
         name="Full Investigation",
-        description="Broadest current review.",
-        default_profile_key="deep",
-        availability_note="Later phase. Uses the broadest current scan path for now.",
+        description="Broadest current review path.",
+        default_profile_key="insanity",
+        badge="MAX",
+        availability_note="Built on the same engine, but drives the broadest available presentation and grouping pass.",
     ),
 }
 
@@ -790,14 +1437,18 @@ def workflow_menu_lines():
     for index, preset_key in enumerate(WORKFLOW_MENU_ORDER, start=1):
         preset = WORKFLOW_PRESETS[preset_key]
         if preset.key == DEFAULT_WORKFLOW_PRESET_KEY:
-            prefix = color("Recommended", BOLD + SUCCESS)
+            prefix = badge("RECOMMENDED", SUCCESS)
         elif preset.availability_note:
-            prefix = color("Later phase", BOLD + WARNING)
+            prefix = badge(preset.badge or "ADVANCED", WARNING)
         else:
-            prefix = color("Available", BOLD + ACCENT)
+            prefix = badge(preset.badge or "ACTIVE", ACCENT)
         lines.append(f"{color(str(index), BOLD + ACCENT)}  {preset.name.ljust(18)} {prefix}  {preset.description}")
 
-    lines.append(f"{color(str(len(WORKFLOW_MENU_ORDER) + 1), BOLD + ACCENT)}  Exit")
+    lines.append(
+        f"{color(str(len(WORKFLOW_MENU_ORDER) + 1), BOLD + ACCENT)}  Check intel updates  "
+        f"{badge('MAINT', SUCCESS)}  Refresh keyword data from the remote feed"
+    )
+    lines.append(f"{color(str(len(WORKFLOW_MENU_ORDER) + 2), BOLD + ACCENT)}  Exit")
     return lines
 
 
@@ -810,7 +1461,7 @@ def print_compact_message(text, tone=DIM + MUTED, indent=2):
 
 def print_workflow_preset_summary(workflow_preset):
     lines = [
-        f"{color('Workflow', DIM + MUTED)} : {color(workflow_preset.name, BOLD + ACCENT)}",
+        f"{color('Workflow', DIM + MUTED)} : {color(workflow_preset.name, BOLD + ACCENT)}  {badge(workflow_preset.badge or 'ACTIVE', ACCENT)}",
         f"{color('Focus', DIM + MUTED)} : {workflow_preset.description}",
     ]
     if workflow_preset.availability_note:
@@ -826,26 +1477,54 @@ def print_recommended_scan_setup(workflow_preset, profile):
     print_box(
         "Recommended Scan Setup",
         [
-            f"{color('Profile', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}",
+            f"{color('Profile', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}  {badge(profile.badge or 'ACTIVE', SUCCESS)}",
             f"{color('Reason', DIM + MUTED)} : {profile.description}",
+            f"{color('Purpose', DIM + MUTED)} : {profile.purpose or profile.description}",
         ],
         tone=ACCENT,
-        width=min(terminal_width(), 88),
+        width=min(ui_width(), 96),
     )
 
 
 def choose_workflow_preset():
-    print_step(1, WORKFLOW_PRESETS[DEFAULT_WORKFLOW_PRESET_KEY].step_total, "Choose workflow", "Core Lookup is the best starting point for most scans.")
+    print_step(1, WORKFLOW_PRESETS[DEFAULT_WORKFLOW_PRESET_KEY].step_total, "Choose workflow", "Pick the investigation posture you want before selecting input.")
 
     while True:
-        print_box(
-            "Main Menu",
-            workflow_menu_lines(),
-            tone=PRIMARY,
-            width=min(terminal_width(), 92),
+        header("MAIN MENU", "Choose an investigation lane or run an intel maintenance check.")
+
+        for index, preset_key in enumerate(WORKFLOW_MENU_ORDER, start=1):
+            preset = WORKFLOW_PRESETS[preset_key]
+            tone = SUCCESS if preset.key == DEFAULT_WORKFLOW_PRESET_KEY else (WARNING if preset.availability_note else PRIMARY)
+            print_option_panel(
+                index=index,
+                title=preset.name,
+                badge_text=preset.badge or "ACTIVE",
+                summary=preset.description,
+                detail=f"Default profile: {SCAN_PROFILES[preset.default_profile_key].name}",
+                note=preset.availability_note,
+                tone=tone,
+                width=min(ui_width(), 100),
+            )
+
+        print_option_panel(
+            index=len(WORKFLOW_MENU_ORDER) + 1,
+            title="Check Intel Updates",
+            badge_text="MAINT",
+            summary="Compare your local keyword bundle with the remote feed and optionally apply updates.",
+            detail="Useful when public infra and provider knowledge has moved on.",
+            tone=ACCENT,
+            width=min(ui_width(), 100),
+        )
+        print_option_panel(
+            index=len(WORKFLOW_MENU_ORDER) + 2,
+            title="Exit",
+            badge_text="QUIT",
+            summary="Close the console.",
+            tone=MUTED,
+            width=min(ui_width(), 100),
         )
 
-        choice = prompt(f"Choose a workflow [1-{len(WORKFLOW_MENU_ORDER) + 1}, Enter=1]: ")
+        choice = prompt(f"Choose a workflow [1-{len(WORKFLOW_MENU_ORDER) + 2}, Enter=1]: ")
         if not choice:
             choice = "1"
 
@@ -856,9 +1535,12 @@ def choose_workflow_preset():
                 print_workflow_preset_summary(workflow_preset)
                 return workflow_preset
             if choice_number == len(WORKFLOW_MENU_ORDER) + 1:
+                run_intel_update_check()
+                continue
+            if choice_number == len(WORKFLOW_MENU_ORDER) + 2:
                 sys.exit(0)
 
-        print(color("Invalid choice.", WARNING))
+        print_notice("Invalid choice. Enter one of the listed workflow numbers.", WARNING)
 
 
 def suspicion_color(label):
@@ -941,6 +1623,177 @@ def extract_ips(text):
 def chunk_list(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+SPECIAL_IP_FAILURES = [
+    {
+        "network": ipaddress.ip_network("10.0.0.0/8"),
+        "category": "RFC1918 private IPv4",
+        "detail": "Internal-use IPv4 space. It is not publicly routable, so public IP lookup services usually return no result.",
+    },
+    {
+        "network": ipaddress.ip_network("172.16.0.0/12"),
+        "category": "RFC1918 private IPv4",
+        "detail": "Internal-use IPv4 space. It is not publicly routable, so public IP lookup services usually return no result.",
+    },
+    {
+        "network": ipaddress.ip_network("192.168.0.0/16"),
+        "category": "RFC1918 private IPv4",
+        "detail": "Internal-use IPv4 space. It is not publicly routable, so public IP lookup services usually return no result.",
+    },
+    {
+        "network": ipaddress.ip_network("100.64.0.0/10"),
+        "category": "Carrier-grade NAT space",
+        "detail": "Shared address space used by ISPs between customers and the public Internet. It is not globally routable.",
+    },
+    {
+        "network": ipaddress.ip_network("169.254.0.0/16"),
+        "category": "Link-local IPv4",
+        "detail": "Auto-configured local-link address. It only works on the local network segment and is not Internet-routable.",
+    },
+    {
+        "network": ipaddress.ip_network("127.0.0.0/8"),
+        "category": "Loopback IPv4",
+        "detail": "Points back to the local machine itself. It never appears as a public Internet source address.",
+    },
+    {
+        "network": ipaddress.ip_network("224.0.0.0/4"),
+        "category": "Multicast IPv4",
+        "detail": "Reserved for multicast delivery rather than normal host assignment, so public IP ownership lookups do not apply.",
+    },
+    {
+        "network": ipaddress.ip_network("240.0.0.0/4"),
+        "category": "Reserved IPv4",
+        "detail": "Reserved or future-use IPv4 space. These addresses are not generally assigned for public Internet hosts.",
+    },
+    {
+        "network": ipaddress.ip_network("198.18.0.0/15"),
+        "category": "Benchmark/testing IPv4",
+        "detail": "Reserved for network benchmark tests. It is not used as normal public Internet address space.",
+    },
+    {
+        "network": ipaddress.ip_network("192.0.2.0/24"),
+        "category": "Documentation IPv4",
+        "detail": "Reserved for examples and documentation. It is not assigned to public Internet hosts.",
+    },
+    {
+        "network": ipaddress.ip_network("198.51.100.0/24"),
+        "category": "Documentation IPv4",
+        "detail": "Reserved for examples and documentation. It is not assigned to public Internet hosts.",
+    },
+    {
+        "network": ipaddress.ip_network("203.0.113.0/24"),
+        "category": "Documentation IPv4",
+        "detail": "Reserved for examples and documentation. It is not assigned to public Internet hosts.",
+    },
+    {
+        "network": ipaddress.ip_network("0.0.0.0/32"),
+        "category": "Unspecified IPv4",
+        "detail": "Special all-zero source/default address. It is not a routable host address.",
+    },
+    {
+        "network": ipaddress.ip_network("fc00::/7"),
+        "category": "Unique local IPv6",
+        "detail": "Private-use IPv6 space for internal networks. It is not publicly routable.",
+    },
+    {
+        "network": ipaddress.ip_network("fe80::/10"),
+        "category": "Link-local IPv6",
+        "detail": "Local-link IPv6 space used only on the current network segment. It is not Internet-routable.",
+    },
+    {
+        "network": ipaddress.ip_network("::1/128"),
+        "category": "Loopback IPv6",
+        "detail": "Points back to the local machine itself. It never appears as a public Internet source address.",
+    },
+    {
+        "network": ipaddress.ip_network("ff00::/8"),
+        "category": "Multicast IPv6",
+        "detail": "Reserved for multicast delivery rather than normal host assignment, so public IP ownership lookups do not apply.",
+    },
+    {
+        "network": ipaddress.ip_network("2001:db8::/32"),
+        "category": "Documentation IPv6",
+        "detail": "Reserved for examples and documentation. It is not assigned to public Internet hosts.",
+    },
+    {
+        "network": ipaddress.ip_network("::/128"),
+        "category": "Unspecified IPv6",
+        "detail": "Special all-zero source/default address. It is not a routable host address.",
+    },
+]
+
+
+def describe_lookup_failure(ip, api_message=""):
+    parsed = parse_ip_token(ip)
+    api_message = (api_message or "").strip()
+
+    if parsed is None:
+        return {
+            "failure_category": "Invalid IP",
+            "failure_range": "",
+            "failure_detail": "The value could not be parsed as a valid IPv4 or IPv6 address.",
+        }
+
+    for entry in SPECIAL_IP_FAILURES:
+        if parsed in entry["network"]:
+            return {
+                "failure_category": entry["category"],
+                "failure_range": str(entry["network"]),
+                "failure_detail": entry["detail"],
+            }
+
+    if parsed.is_private:
+        return {
+            "failure_category": "Private-use address",
+            "failure_range": "",
+            "failure_detail": "This address is not globally routable, so public IP lookup services usually return no result.",
+        }
+
+    if parsed.is_reserved:
+        return {
+            "failure_category": "Reserved address space",
+            "failure_range": "",
+            "failure_detail": "This address is part of reserved address space and is not normally assigned as a public Internet host.",
+        }
+
+    if parsed.is_loopback:
+        return {
+            "failure_category": "Loopback address",
+            "failure_range": "",
+            "failure_detail": "This address points back to the local machine and is never a public Internet host address.",
+        }
+
+    if parsed.is_link_local:
+        return {
+            "failure_category": "Link-local address",
+            "failure_range": "",
+            "failure_detail": "This address only works on the local network segment and is not Internet-routable.",
+        }
+
+    if parsed.is_multicast:
+        return {
+            "failure_category": "Multicast address",
+            "failure_range": "",
+            "failure_detail": "This address is reserved for multicast traffic, not normal public host assignment.",
+        }
+
+    if parsed.is_unspecified:
+        return {
+            "failure_category": "Unspecified address",
+            "failure_range": "",
+            "failure_detail": "This is a special placeholder/default address, not a usable public host address.",
+        }
+
+    failure_detail = "The remote lookup service did not return usable public network metadata for this address."
+    if api_message:
+        failure_detail += f" Remote reason: {api_message}."
+
+    return {
+        "failure_category": "Lookup returned no public data",
+        "failure_range": "",
+        "failure_detail": failure_detail,
+    }
 
 
 # ==================================================
@@ -1144,11 +1997,7 @@ def compute_suspicion_score(item):
         score += 2
         reasons.append("isp_org_same_vendor(+2)")
 
-    hostingish_words = [
-        "hosting", "cloud", "server", "datacenter", "data center",
-        "vps", "colo", "colocation", "proxy", "vpn"
-    ]
-    if any(word in asname_field for word in hostingish_words):
+    if any(word in asname_field for word in HOSTING_LIKE_TERMS):
         score += 2
         reasons.append("asname_hosting_like(+2)")
 
@@ -1198,11 +2047,23 @@ def likely_type(item):
 
 def build_result_record(item, counts):
     query = item.get("query", "")
+    status = item.get("status", "")
+    if status == "success":
+        failure_info = {
+            "failure_category": "",
+            "failure_range": "",
+            "failure_detail": "",
+        }
+    else:
+        failure_info = describe_lookup_failure(query, item.get("message", ""))
     record = IPResultRecord(
         query=query,
         count=counts.get(query, 1),
-        status=item.get("status", ""),
+        status=status,
         message=item.get("message", ""),
+        failure_category=failure_info["failure_category"],
+        failure_range=failure_info["failure_range"],
+        failure_detail=failure_info["failure_detail"],
         country=item.get("country", ""),
         countryCode=item.get("countryCode", ""),
         regionName=item.get("regionName", ""),
@@ -1399,6 +2260,17 @@ def format_risk_summary(item):
     return f"{flag}  |  score {score}  |  {likely_type(item)}"
 
 
+def format_failure_summary(item):
+    category = item.get("failure_category", "") or ""
+    failure_range = item.get("failure_range", "") or ""
+
+    if category and failure_range:
+        return f"{category} ({failure_range})"
+    if category:
+        return category
+    return item.get("message", "Unknown error") or "Unknown error"
+
+
 def summarize_duplicates(counts):
     return [(ip, count) for ip, count in counts.items() if count > 1]
 
@@ -1587,7 +2459,7 @@ def print_results_table(results, counts):
                 color(format_ip_display(ip, columns[0]["width"]), BOLD + DANGER),
                 hits,
                 color("Lookup failed", DANGER),
-                safe(item.get("message", "Unknown error"), columns[3]["width"]),
+                safe(format_failure_summary(item), columns[3]["width"]),
                 color("-", DIM + MUTED),
                 color("-", DIM + MUTED),
                 color("FAILED", BOLD + DANGER),
@@ -1631,6 +2503,12 @@ def print_detailed_results(results, counts):
             if has_positive_reverse_dns(item):
                 lines.extend(wrap_label_value("rDNS", format_reverse_dns(item), width))
             lines.extend(wrap_label_value("Status", f"Lookup failed: {item.get('message', 'Unknown error')}", width, DANGER))
+            if item.get("failure_category"):
+                lines.extend(wrap_label_value("Class", item.get("failure_category"), width))
+            if item.get("failure_range"):
+                lines.extend(wrap_label_value("Range", item.get("failure_range"), width))
+            if item.get("failure_detail"):
+                lines.extend(wrap_label_value("Why", item.get("failure_detail"), width))
             print_box(
                 detailed_box_title(ip, seen, width),
                 lines,
@@ -1826,6 +2704,552 @@ def print_subnet_summary(results, counts, limit=10):
         print(color(f"Showing top {limit} of {len(ranked)} subnets.", DIM + MUTED))
 
 
+def summarize_provider_rows(results, counts):
+    summary = defaultdict(lambda: {"unique": 0, "hits": 0, "top_flag": "NONE"})
+    priority = {"VERY HIGH": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0}
+
+    for item in results:
+        if item.get("status") != "success":
+            continue
+
+        provider = format_provider(item)
+        if not provider or provider == "N/A":
+            continue
+
+        flag, _, _ = suspicion_score(item)
+        summary[provider]["unique"] += 1
+        summary[provider]["hits"] += counts.get(item.get("query", ""), 1)
+        if priority[flag] > priority[summary[provider]["top_flag"]]:
+            summary[provider]["top_flag"] = flag
+
+    ranked = sorted(summary.items(), key=lambda entry: (entry[1]["hits"], entry[1]["unique"]), reverse=True)
+    return [(label, data) for label, data in ranked if data["unique"] > 1 or data["hits"] > 1]
+
+
+def summarize_failed_lookup_rows(results, counts):
+    summary = defaultdict(lambda: {"unique": 0, "hits": 0})
+
+    for item in results:
+        if item.get("status") == "success":
+            continue
+
+        key = (
+            item.get("failure_category", "") or "Lookup failure",
+            item.get("failure_range", "") or "-",
+        )
+        summary[key]["unique"] += 1
+        summary[key]["hits"] += counts.get(item.get("query", ""), 1)
+
+    ranked = sorted(summary.items(), key=lambda entry: (entry[1]["hits"], entry[1]["unique"]), reverse=True)
+    return ranked
+
+
+def collect_result_stats(results, counts, invalid_ips=None):
+    successful = [item for item in results if item.get("status") == "success"]
+    failed = [item for item in results if item.get("status") != "success"]
+    high_risk_items = []
+    tor_flagged = 0
+    proxy_flagged = 0
+    hosting_flagged = 0
+    mobile_flagged = 0
+    countries = set()
+
+    for item in successful:
+        flag, _, _ = suspicion_score(item)
+        if flag in ("VERY HIGH", "HIGH"):
+            high_risk_items.append(item)
+        if item.get("tor_exit"):
+            tor_flagged += 1
+        if item.get("proxy"):
+            proxy_flagged += 1
+        if item.get("hosting"):
+            hosting_flagged += 1
+        if item.get("mobile"):
+            mobile_flagged += 1
+        if item.get("country"):
+            countries.add(item.get("country"))
+
+    asn_rows = summarize_asn_rows(results, counts)
+    subnet_rows = summarize_subnet_rows(results, counts)
+    provider_rows = summarize_provider_rows(results, counts)
+
+    return {
+        "total_unique": len(results),
+        "total_hits": sum(counts.values()),
+        "successful": len(successful),
+        "failed": len(failed),
+        "high_risk": len(high_risk_items),
+        "tor_flagged": tor_flagged,
+        "proxy_flagged": proxy_flagged,
+        "hosting_flagged": hosting_flagged,
+        "mobile_flagged": mobile_flagged,
+        "country_count": len(countries),
+        "invalid_count": len(invalid_ips or []),
+        "top_asn": asn_rows[0][0] if asn_rows else "N/A",
+        "top_subnet": subnet_rows[0][0] if subnet_rows else "N/A",
+        "top_provider": provider_rows[0][0] if provider_rows else "N/A",
+        "high_risk_items": high_risk_items,
+        "failed_items": failed,
+    }
+
+
+def metric_card(metric_key, stats):
+    mapping = {
+        "total_unique": ("Unique IPs", stats["total_unique"], "deduplicated scan set", ACCENT),
+        "total_hits": ("Total Hits", stats["total_hits"], "including repeats", ACCENT),
+        "successful": ("Resolved", stats["successful"], "public lookups completed", SUCCESS),
+        "failed": ("Failures", stats["failed"], "no public metadata", WARNING if stats["failed"] else SUCCESS),
+        "high_risk": ("High Risk", stats["high_risk"], "very high + high", DANGER if stats["high_risk"] else SUCCESS),
+        "tor_flagged": ("Tor", stats["tor_flagged"], "exit nodes matched", MAGENTA if stats["tor_flagged"] else SUCCESS),
+        "proxy_flagged": ("Proxy", stats["proxy_flagged"], "proxy flag true", DANGER if stats["proxy_flagged"] else SUCCESS),
+        "hosting_flagged": ("Hosting", stats["hosting_flagged"], "hosting flag true", WARNING if stats["hosting_flagged"] else SUCCESS),
+        "mobile_flagged": ("Mobile", stats["mobile_flagged"], "mobile flag true", BLUE if stats["mobile_flagged"] else SUCCESS),
+        "country_count": ("Countries", stats["country_count"], "distinct geo buckets", ACCENT),
+        "top_asn": ("Top ASN", safe(stats["top_asn"], 24), "most repeated network", ACCENT),
+        "top_subnet": ("Top Subnet", format_subnet_display(stats["top_subnet"], 22), "highest repeated prefix", ACCENT),
+        "top_provider": ("Top Provider", safe(stats["top_provider"], 24), "most repeated provider", ACCENT),
+        "invalid_count": ("Invalid", stats["invalid_count"], "ignored input entries", WARNING if stats["invalid_count"] else SUCCESS),
+    }
+    return mapping.get(metric_key)
+
+
+def format_signal_tags(item, compact=False):
+    tags = []
+    if item.get("tor_exit"):
+        tags.append(("TOR", MAGENTA))
+    if item.get("proxy"):
+        tags.append(("PRX", DANGER))
+    if item.get("hosting"):
+        tags.append(("HST", WARNING))
+    if item.get("mobile"):
+        tags.append(("MOB", BLUE))
+
+    if not tags:
+        return "CLEAR" if compact else color("No notable transport flags", DIM + MUTED)
+
+    if compact:
+        return "/".join(label for label, _ in tags)
+    return " ".join(badge(label, tone) for label, tone in tags)
+
+
+def compact_detail_text(item):
+    if item.get("status") != "success":
+        return format_failure_summary(item)
+    return safe(format_provider(item), 26)
+
+
+def build_results_table_columns(profile):
+    if profile.table_mode == "compact":
+        columns = [
+            {"title": "IP", "width": 28, "min_width": 18},
+            {"title": "Hits", "width": 4, "min_width": 4, "align": "right"},
+            {"title": "Location", "width": 20, "min_width": 12},
+            {"title": "Signals", "width": 11, "min_width": 8},
+            {"title": "Risk", "width": 10, "min_width": 8},
+            {"title": "Type", "width": 18, "min_width": 12},
+        ]
+    elif profile.table_mode == "expanded" and ui_width() >= 118:
+        columns = [
+            {"title": "IP", "width": 28, "min_width": 18},
+            {"title": "Hits", "width": 4, "min_width": 4, "align": "right"},
+            {"title": "Location", "width": 18, "min_width": 12},
+            {"title": "Network", "width": 22, "min_width": 16},
+            {"title": "Provider", "width": 22, "min_width": 16},
+            {"title": "Signals", "width": 11, "min_width": 8},
+            {"title": "Risk", "width": 10, "min_width": 8},
+            {"title": "Type", "width": 18, "min_width": 12},
+        ]
+    else:
+        columns = [
+            {"title": "IP", "width": 28, "min_width": 18},
+            {"title": "Hits", "width": 4, "min_width": 4, "align": "right"},
+            {"title": "Location", "width": 20, "min_width": 12},
+            {"title": "Provider", "width": 24, "min_width": 16},
+            {"title": "Signals", "width": 11, "min_width": 8},
+            {"title": "Score", "width": 5, "min_width": 5, "align": "right"},
+            {"title": "Risk", "width": 10, "min_width": 8},
+            {"title": "Type", "width": 18, "min_width": 12},
+        ]
+
+    fitted = fit_column_widths(columns, max_total=ui_width(124))
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+    return columns
+
+
+def print_input_summary(valid_ips, invalid_ips, counts):
+    header("VALIDATION SUMMARY", "Input was normalized, deduplicated, and prepared for enrichment.")
+    cards = [
+        ("Unique IPs", len(valid_ips), "validated", SUCCESS),
+        ("Total Hits", sum(counts.values()), "including repeats", ACCENT),
+        ("Invalid", len(invalid_ips), "ignored entries", WARNING if invalid_ips else SUCCESS),
+        ("Address Mix", f"v4/v6", f"{sum(1 for ip in valid_ips if detect_ip_version(ip) == 4)}/{sum(1 for ip in valid_ips if detect_ip_version(ip) == 6)}", ACCENT),
+    ]
+    print_stat_cards(cards, preferred_width=25)
+    print_box(
+        "Prepared Input",
+        [
+            "The scan will use deduplicated addresses for lookup and preserve repeat counts for summaries and export.",
+            "Private, reserved, and local-only ranges are accepted and explained separately if public metadata cannot be resolved.",
+        ],
+        tone=ACCENT,
+        width=min(ui_width(), 108),
+    )
+
+
+def print_result_overview(results, counts, profile, invalid_ips=None):
+    stats = collect_result_stats(results, counts, invalid_ips=invalid_ips)
+    header("EXECUTIVE OVERVIEW", "High-signal metrics before the heavier matrices and clustering sections.")
+
+    cards = [metric_card(key, stats) for key in profile.overview_metrics]
+    cards = [card for card in cards if card is not None]
+    print_stat_cards(cards, preferred_width=24)
+
+    narrative = [
+        f"{badge(profile.name, ACCENT)} {profile.description}",
+        f"Top provider cluster: {safe(stats['top_provider'], 56)}",
+        f"Top network cluster: {safe(stats['top_asn'], 56)}",
+    ]
+    print_box("Review Posture", narrative, tone=PRIMARY, width=min(ui_width(), 108))
+
+
+def print_high_risk_findings(results, counts, profile, limit=None):
+    risk_items = [item for item in results if item.get("status") == "success" and suspicion_score(item)[0] in ("VERY HIGH", "HIGH")]
+    if not risk_items:
+        return
+
+    limit = limit or (12 if profile.key == "insanity" else 8)
+    header("HIGH RISK FINDINGS", "Prioritized entries with the strongest signal combination.")
+    columns = [
+        {"title": "IP", "width": 28, "min_width": 18},
+        {"title": "Hits", "width": 4, "min_width": 4, "align": "right"},
+        {"title": "Signals", "width": 11, "min_width": 8},
+        {"title": "Provider", "width": 28, "min_width": 16},
+        {"title": "Risk", "width": 10, "min_width": 8},
+        {"title": "Reasons", "width": 28, "min_width": 18},
+    ]
+    fitted = fit_column_widths(columns, max_total=ui_width(124))
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+
+    rows = []
+    for item in risk_items[:limit]:
+        flag, reasons, _ = suspicion_score(item)
+        rows.append([
+            color(format_ip_display(item.get("query", "N/A"), columns[0]["width"]), BOLD + suspicion_color(flag)),
+            str(counts.get(item.get("query", ""), 1)),
+            color(format_signal_tags(item, compact=True), signal_tone(item)),
+            safe(format_provider(item), columns[3]["width"]),
+            color(flag, BOLD + suspicion_color(flag)),
+            safe(", ".join(reasons), columns[5]["width"]),
+        ])
+
+    render_table(columns, rows, tone=DANGER)
+    if len(risk_items) > limit:
+        print_notice(f"Showing top {limit} of {len(risk_items)} high-risk findings.", MUTED)
+
+
+def print_results_table(results, counts, profile):
+    header("FULL RESULTS MATRIX", "Sorted by suspicion first with profile-aware density and cleaner signal hierarchy.")
+    columns = build_results_table_columns(profile)
+    titles = [column["title"] for column in columns]
+    rows = []
+
+    for item in results:
+        ip = item.get("query", "N/A")
+        hits = str(counts.get(ip, 1))
+
+        if item.get("status") != "success":
+            base = {
+                "IP": color(format_ip_display(ip, next(column["width"] for column in columns if column["title"] == "IP")), BOLD + DANGER),
+                "Hits": hits,
+                "Location": color("Lookup failed", DANGER),
+                "Network": color("-", DIM + MUTED),
+                "Provider": safe(format_failure_summary(item), next(column["width"] for column in columns if column["title"] in {"Provider", "Network"})),
+                "Signals": color("-", DIM + MUTED),
+                "Score": color("-", DIM + MUTED),
+                "Risk": color("FAILED", BOLD + DANGER),
+                "Type": color("Lookup Failed", DANGER),
+            }
+            if "Provider" not in titles and "Network" not in titles:
+                base["Location"] = safe(format_failure_summary(item), next(column["width"] for column in columns if column["title"] == "Location"))
+            rows.append([base[title] for title in titles])
+            continue
+
+        flag, _, score = suspicion_score(item)
+        ip_type = likely_type(item)
+        base = {
+            "IP": color(format_ip_display(ip, next(column["width"] for column in columns if column["title"] == "IP")), BOLD + suspicion_color(flag) if flag in ("VERY HIGH", "HIGH") else BOLD),
+            "Hits": hits,
+            "Location": safe(format_location(item), next(column["width"] for column in columns if column["title"] == "Location")),
+            "Network": safe(format_network(item), next((column["width"] for column in columns if column["title"] == "Network"), 18)),
+            "Provider": safe(format_provider(item), next((column["width"] for column in columns if column["title"] == "Provider"), 24)),
+            "Signals": color(format_signal_tags(item, compact=True), signal_tone(item)),
+            "Score": format_score(score),
+            "Risk": color(flag, BOLD + suspicion_color(flag)),
+            "Type": color(safe(ip_type, next((column["width"] for column in columns if column["title"] == "Type"), 18)), type_tone(ip_type)),
+        }
+        rows.append([base[title] for title in titles])
+
+    render_table(columns, rows, tone=PRIMARY)
+
+
+def print_detailed_results(results, counts, profile=None):
+    header("DETAILED INTELLIGENCE", "Expanded per-IP cards with a calmer layout and stronger hierarchy.")
+    width = min(ui_width(110), 110)
+
+    if profile and profile.detail_mode == "suspicious":
+        filtered = [
+            item for item in results
+            if item.get("status") != "success" or suspicion_score(item)[0] in ("VERY HIGH", "HIGH", "MEDIUM")
+        ]
+    else:
+        filtered = list(results)
+
+    for item in filtered:
+        ip = item.get("query", "N/A")
+        seen = counts.get(ip, 1)
+
+        if item.get("status") != "success":
+            lines = [
+                f"{badge('FAILED', DANGER)} {badge(item.get('failure_category', 'LOOKUP'), WARNING)}",
+                "",
+                f"{color('Remote', DIM + MUTED)} : {item.get('message', 'Unknown error')}",
+            ]
+            if item.get("failure_range"):
+                lines.append(f"{color('Range', DIM + MUTED)} : {item.get('failure_range')}")
+            if item.get("failure_detail"):
+                lines.extend(wrap_label_value("Why", item.get("failure_detail"), width))
+            print_box(detailed_box_title(ip, seen, width), lines, tone=DANGER, width=width)
+            continue
+
+        flag, reasons, score = suspicion_score(item)
+        lines = [
+            f"{badge(flag, suspicion_color(flag))} {badge(likely_type(item), type_tone(likely_type(item)))} {format_signal_tags(item)}",
+            "",
+        ]
+        lines.extend(wrap_label_value("Location", format_detailed_location(item), width))
+        lines.extend(wrap_label_value("Provider", format_provider(item), width))
+
+        network_text = format_network(item)
+        if network_text != "N/A":
+            lines.extend(wrap_label_value("Network", network_text, width))
+
+        if has_positive_reverse_dns(item):
+            lines.extend(wrap_label_value("rDNS", format_reverse_dns(item), width))
+
+        if has_interesting_tor_state(item):
+            lines.extend(wrap_label_value("Tor", format_tor_status(item), width, MAGENTA if item.get("tor_exit") else None))
+
+        lines.extend(wrap_label_value("Score", f"{score} points", width, suspicion_color(flag)))
+        lines.extend(wrap_label_value("Reasons", ", ".join(reasons) if reasons else "None", width))
+
+        print_box(detailed_box_title(ip, seen, width), lines, tone=suspicion_color(flag), width=width)
+
+
+def print_country_grouping(results, counts):
+    groups = summarize_country_groups(results, counts)
+    if not groups:
+        return
+
+    header("COUNTRY AND REGION CLUSTERING", "Only repeated geographies are shown so the section stays investigative, not noisy.")
+
+    for country, items, total_hits in groups:
+        print_box(
+            country,
+            [
+                f"{color('Unique IPs', DIM + MUTED)} : {len(items)}",
+                f"{color('Total Hits', DIM + MUTED)} : {total_hits}",
+            ],
+            tone=ACCENT,
+            width=min(ui_width(), 80),
+        )
+
+        columns = [
+            {"title": "IP", "width": 28, "min_width": 18},
+            {"title": "City", "width": 18, "min_width": 12},
+            {"title": "Provider", "width": 26, "min_width": 16},
+            {"title": "Risk", "width": 10, "min_width": 8},
+            {"title": "Type", "width": 18, "min_width": 12},
+        ]
+        fitted = fit_column_widths(columns, max_total=ui_width(116))
+        for column, width in zip(columns, fitted):
+            column["width"] = width
+
+        rows = []
+        for item in items:
+            flag, _, _ = suspicion_score(item)
+            ip_type = likely_type(item)
+            rows.append([
+                format_ip_display(item.get("query", "N/A"), columns[0]["width"]),
+                safe(item.get("city", "N/A"), columns[1]["width"]),
+                safe(format_provider(item), columns[2]["width"]),
+                color(flag, BOLD + suspicion_color(flag)),
+                color(safe(ip_type, columns[4]["width"]), type_tone(ip_type)),
+            ])
+
+        render_table(columns, rows, tone=ACCENT)
+
+
+def print_duplicates(counts):
+    duplicates = summarize_duplicates(counts)
+    if not duplicates:
+        return
+
+    header("DUPLICATE HIT REVIEW", "Repeated addresses are surfaced here so reuse is visible immediately.")
+    duplicates.sort(key=lambda x: x[1], reverse=True)
+    columns = [
+        {"title": "IP", "width": 28, "min_width": 18},
+        {"title": "Seen", "width": 6, "min_width": 6, "align": "right"},
+    ]
+    rows = [[format_ip_display(ip, columns[0]["width"]), color(str(count), BOLD + ACCENT)] for ip, count in duplicates]
+    render_table(columns, rows, tone=ACCENT)
+
+
+def print_invalid(invalid):
+    if not invalid:
+        return
+
+    header("INVALID AND SKIPPED INPUT", "These values were ignored before lookup because they did not parse as valid IP addresses.")
+    wrapped = textwrap.wrap(", ".join(invalid), width=max(30, min(ui_width(), 108) - 8))
+    print_box("Skipped Entries", [color(line, WARNING) for line in wrapped], tone=WARNING, width=min(ui_width(), 108))
+
+
+def print_type_summary(results, counts):
+    header("TYPE DISTRIBUTION", "Classification rollup by unique addresses and observed hit volume.")
+
+    summary = Counter()
+    total_hits_by_type = Counter()
+
+    for item in results:
+        if item.get("status") != "success":
+            summary["Lookup Failed"] += 1
+            total_hits_by_type["Lookup Failed"] += counts.get(item.get("query", ""), 1)
+            continue
+
+        ip_type = likely_type(item)
+        summary[ip_type] += 1
+        total_hits_by_type[ip_type] += counts.get(item.get("query", ""), 1)
+
+    columns = [
+        {"title": "Type", "width": 24, "min_width": 16},
+        {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
+        {"title": "Hits", "width": 6, "min_width": 6, "align": "right"},
+    ]
+    rows = []
+    for label, unique_count in summary.most_common():
+        rows.append([
+            color(safe(label, columns[0]["width"]), type_tone(label)),
+            color(str(unique_count), BOLD + ACCENT),
+            color(str(total_hits_by_type[label]), BOLD + ACCENT),
+        ])
+    render_table(columns, rows, tone=ACCENT)
+
+
+def print_provider_summary(results, counts, limit=10):
+    ranked = summarize_provider_rows(results, counts)
+    if not ranked:
+        return
+
+    header("NETWORK OWNERSHIP PATTERNS", "Provider repetition can reveal infrastructure concentration even before deep attribution.")
+    columns = [
+        {"title": "Provider", "width": 42, "min_width": 22},
+        {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
+        {"title": "Hits", "width": 6, "min_width": 6, "align": "right"},
+        {"title": "Top Risk", "width": 10, "min_width": 8},
+    ]
+    fitted = fit_column_widths(columns, max_total=ui_width(118))
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+
+    rows = []
+    for label, data in ranked[:limit]:
+        rows.append([
+            safe(label, columns[0]["width"]),
+            color(str(data["unique"]), BOLD + ACCENT),
+            color(str(data["hits"]), BOLD + ACCENT),
+            color(data["top_flag"], BOLD + suspicion_color(data["top_flag"])),
+        ])
+    render_table(columns, rows, tone=ACCENT)
+
+
+def print_asn_summary(results, counts, limit=10):
+    ranked = summarize_asn_rows(results, counts)
+    if not ranked:
+        return
+
+    header("ASN CLUSTERING", "Repeated or clustered networks are ranked by hit concentration.")
+    columns = [
+        {"title": "ASN / Name", "width": 44, "min_width": 24},
+        {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
+        {"title": "Hits", "width": 6, "min_width": 6, "align": "right"},
+    ]
+    fitted = fit_column_widths(columns, max_total=ui_width(118))
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+
+    rows = []
+    for label, data in ranked[:limit]:
+        rows.append([
+            safe(label, columns[0]["width"]),
+            color(str(data["unique"]), BOLD + ACCENT),
+            color(str(data["hits"]), BOLD + ACCENT),
+        ])
+    render_table(columns, rows, tone=ACCENT)
+
+
+def print_subnet_summary(results, counts, limit=10):
+    ranked = summarize_subnet_rows(results, counts)
+    if not ranked:
+        return
+
+    header("SUBNET CLUSTERING", "Repeated IPv4 /24 and IPv6 /64 ranges often reveal operational grouping.")
+    columns = [
+        {"title": "Subnet", "width": 43, "min_width": 18},
+        {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
+        {"title": "Hits", "width": 6, "min_width": 6, "align": "right"},
+    ]
+    fitted = fit_column_widths(columns, max_total=ui_width(118))
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+
+    rows = []
+    for subnet, data in ranked[:limit]:
+        rows.append([
+            format_subnet_display(subnet, columns[0]["width"]),
+            color(str(data["unique"]), BOLD + ACCENT),
+            color(str(data["hits"]), BOLD + ACCENT),
+        ])
+    render_table(columns, rows, tone=ACCENT)
+
+
+def print_failed_lookup_summary(results, counts, limit=12):
+    ranked = summarize_failed_lookup_rows(results, counts)
+    if not ranked:
+        return
+
+    header("FAILED LOOKUP REVIEW", "Structured reasons for addresses that did not return public metadata.")
+    columns = [
+        {"title": "Class", "width": 24, "min_width": 16},
+        {"title": "Range", "width": 24, "min_width": 12},
+        {"title": "Unique", "width": 6, "min_width": 6, "align": "right"},
+        {"title": "Hits", "width": 6, "min_width": 6, "align": "right"},
+    ]
+    fitted = fit_column_widths(columns, max_total=ui_width(112))
+    for column, width in zip(columns, fitted):
+        column["width"] = width
+
+    rows = []
+    for (failure_class, failure_range), data in ranked[:limit]:
+        rows.append([
+            safe(failure_class, columns[0]["width"]),
+            format_subnet_display(failure_range, columns[1]["width"]),
+            color(str(data["unique"]), BOLD + ACCENT),
+            color(str(data["hits"]), BOLD + ACCENT),
+        ])
+    render_table(columns, rows, tone=WARNING)
+
+
 # ==================================================
 # Enrichment Routing
 # ==================================================
@@ -1835,28 +3259,34 @@ ENRICHMENT_RENDERERS = {
     "type_summary": print_type_summary,
     "duplicates": lambda results, counts: print_duplicates(counts),
     "country_grouping": print_country_grouping,
+    "provider_summary": print_provider_summary,
     "asn_summary": print_asn_summary,
     "subnet_summary": print_subnet_summary,
-    "detailed_results": print_detailed_results,
+    "detailed_results": lambda results, counts, profile=None: print_detailed_results(results, counts, profile),
+    "failed_lookup_summary": print_failed_lookup_summary,
 }
 
 
 def render_enabled_enrichments(results, counts, profile):
-    for option in OPTIONAL_ENRICHMENTS:
-        if option.key == "detailed_results":
+    ordered = profile.section_order or [item.key for item in OPTIONAL_ENRICHMENTS]
+    for key in ordered:
+        if key == "detailed_results":
             continue
-        if profile.is_enabled(option.key):
-            renderer = ENRICHMENT_RENDERERS.get(option.key)
+        if profile.is_enabled(key):
+            renderer = ENRICHMENT_RENDERERS.get(key)
             if renderer:
                 renderer(results, counts)
 
 
 def render_detailed_results_if_enabled(results, counts, profile):
-    if profile.prompt_for_details:
-        if ask_yes_no("Show detailed results too?", default="n"):
-            print_detailed_results(results, counts)
-    elif profile.is_enabled("detailed_results"):
-        print_detailed_results(results, counts)
+    if profile.detail_mode == "none":
+        return
+    if profile.detail_mode == "prompt" or profile.prompt_for_details:
+        if ask_yes_no("Open detailed intelligence cards too?", default=profile.detail_prompt_default):
+            print_detailed_results(results, counts, profile)
+        return
+    if profile.is_enabled("detailed_results") or profile.detail_mode in {"suspicious", "all"}:
+        print_detailed_results(results, counts, profile)
 
 
 # ==================================================
@@ -1871,6 +3301,9 @@ def save_to_csv(results, counts, filename="ip_results.csv"):
             "IP",
             "Count",
             "Status",
+            "FailureClass",
+            "FailureRange",
+            "FailureWhy",
             "TorExit",
             "TorStatus",
             "ReverseDNS",
@@ -1913,6 +3346,9 @@ def save_to_csv(results, counts, filename="ip_results.csv"):
                 ip,
                 item.get("count", counts.get(ip, 1)),
                 item.get("status", ""),
+                item.get("failure_category", ""),
+                item.get("failure_range", ""),
+                item.get("failure_detail", ""),
                 item.get("tor_exit", ""),
                 item.get("tor_status", ""),
                 item.get("reverse_dns", ""),
@@ -1970,19 +3406,20 @@ def save_to_json(results, counts, filename="ip_results.json"):
 
 
 def run_export_flow(results, counts):
+    header("EXPORT STAGE", "Persist the current review to disk if you want a shareable or machine-readable artifact.")
     if ask_yes_no("Save results to CSV?", default="n"):
         filename = prompt("Enter filename [ip_results.csv]: ")
         if not filename:
             filename = "ip_results.csv"
         save_to_csv(results, counts, filename)
-        print(color(f"Saved CSV to {filename}", SUCCESS))
+        print_notice(f"Saved CSV to {filename}", SUCCESS)
 
     if ask_yes_no("Save results to JSON too?", default="n"):
         filename = prompt("Enter filename [ip_results.json]: ")
         if not filename:
             filename = "ip_results.json"
         save_to_json(results, counts, filename)
-        print(color(f"Saved JSON to {filename}", SUCCESS))
+        print_notice(f"Saved JSON to {filename}", SUCCESS)
 
 
 # ==================================================
@@ -1996,15 +3433,17 @@ def read_from_file(path):
 
 
 def read_from_paste():
+    header("PASTE CONSOLE", "Drop IPv4 and IPv6 entries directly into the buffer, then launch the scan when ready.")
     print_box(
         "Paste Mode",
         [
-            "Paste your IPs below.",
-            "Type /start on a new line when you want to begin the lookup.",
-            "Type /clear to reset your pasted input, /cancel to go back, or /help for the guide.",
+            f"{badge('/START', SUCCESS)} begin lookup using the pasted buffer",
+            f"{badge('/CLEAR', WARNING)} clear the current buffer",
+            f"{badge('/CANCEL', WARNING)} return to input selection",
+            f"{badge('/HELP', PRIMARY)} reopen the guide",
         ],
         tone=ACCENT,
-        width=min(terminal_width(), 82),
+        width=min(ui_width(), 92),
     )
     lines = []
 
@@ -2019,16 +3458,16 @@ def read_from_paste():
         if command == "/start":
             if any(entry.strip() for entry in lines):
                 return "\n".join(lines)
-            print(color("Nothing pasted yet.", WARNING))
+            print_notice("Nothing pasted yet.", WARNING)
             continue
 
         if command == "/clear":
             lines.clear()
-            print(color("Pasted input cleared.", WARNING))
+            print_notice("Pasted input cleared.", WARNING)
             continue
 
         if command == "/cancel":
-            print(color("Paste mode cancelled.", WARNING))
+            print_notice("Paste mode cancelled.", WARNING)
             return None
 
         if command == "/help":
@@ -2041,21 +3480,21 @@ def read_from_paste():
 
 
 def choose_input(workflow_preset):
-    print_step(2, workflow_preset.step_total, "Choose input source", "Select how you want to provide the IPs.")
+    print_step(2, workflow_preset.step_total, "Choose input source", "Select the intake path for the current investigation.")
 
     while True:
         print_box(
             "Input Source",
             [
-                f"{color('Enter', BOLD + ACCENT)}  Paste IPs manually",
-                f"{color('F', BOLD + ACCENT)}      Load IPs from file",
-                f"{color('Q', BOLD + ACCENT)}      Exit",
+                f"{badge('ENTER', SUCCESS)} Paste addresses directly into a live intake buffer",
+                f"{badge('F', ACCENT)} Load IPs from an existing text file",
+                f"{badge('Q', WARNING)} Exit the console",
             ],
             tone=PRIMARY,
-            width=min(terminal_width(), 72),
+            width=min(ui_width(), 88),
         )
 
-        choice = prompt("Input source [Enter/F/Q]: ").lower()
+        choice = prompt("Input source [Enter/F/Q]").lower()
 
         if not choice:
             pasted = read_from_paste()
@@ -2067,13 +3506,13 @@ def choose_input(workflow_preset):
             try:
                 return read_from_file(path)
             except FileNotFoundError:
-                print(color("File not found.", DANGER))
+                print_notice("File not found.", DANGER)
             except Exception as e:
-                print(color(f"Failed to read file: {e}", DANGER))
+                print_notice(f"Failed to read file: {e}", DANGER)
             continue
         if choice in {"q", "quit", "exit"}:
             sys.exit(0)
-        print(color("Use Enter for paste mode, F for file, or Q to exit.", WARNING))
+        print_notice("Use Enter for paste mode, F for file input, or Q to exit.", WARNING)
 
 
 # ==================================================
@@ -2089,73 +3528,151 @@ def enabled_enrichment_labels(profile):
     return labels
 
 
+PROFILE_MENU_ORDER = ["quick", "standard", "threat_hunter", "analyst", "insanity", "custom"]
+
+
 def print_scan_profile_summary(profile):
+    enabled_labels = ", ".join(enabled_enrichment_labels(profile)) or "None selected"
     print_box(
         "Scan Profile",
         [
-            f"{color('Selected', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}",
+            f"{color('Selected', DIM + MUTED)} : {color(profile.name, BOLD + ACCENT)}  {badge(profile.badge or 'ACTIVE', ACCENT)}",
             f"{color('Mode', DIM + MUTED)} : {profile.description}",
+            f"{color('Purpose', DIM + MUTED)} : {profile.purpose or profile.description}",
+            f"{color('Density', DIM + MUTED)} : {profile.table_mode} table | detail mode {profile.detail_mode}",
+            f"{color('Enabled', DIM + MUTED)} : {enabled_labels}",
         ],
         tone=ACCENT,
-        width=min(terminal_width(), 84),
+        width=min(ui_width(), 100),
     )
+
+
+def render_custom_option_list(enabled):
+    lines = []
+    for index, item in enumerate(OPTIONAL_ENRICHMENTS, start=1):
+        marker = color("[x]", SUCCESS) if item.key in enabled else color("[ ]", DIM + MUTED)
+        lines.append(f"{marker} {color(str(index), BOLD + ACCENT)}  {item.label.ljust(20)} {muted(item.description)}")
+    return lines
 
 
 def build_custom_scan_profile():
-    print_box(
-        "Custom Options",
-        [
-            "Toggle optional enrichments one by one.",
-            "Defaults follow Standard scan so you can trim or expand from there.",
-        ],
-        tone=ACCENT,
-        width=min(terminal_width(), 84),
-    )
+    header("CUSTOM PROFILE", "Toggle enrichments with a compact checklist, then confirm the final review mode.")
 
-    defaults = SCAN_PROFILES["standard"].enabled
-    enabled = set()
+    defaults = set(SCAN_PROFILES["standard"].enabled)
+    enabled = set(defaults)
 
-    for item in OPTIONAL_ENRICHMENTS:
-        default = "y" if item.key in defaults else "n"
-        question = f"Enable {item.label.lower()}? {item.description}"
-        if ask_yes_no(question, default=default):
-            enabled.add(item.key)
+    while True:
+        print_box(
+            "Custom Options",
+            render_custom_option_list(enabled) + [
+                "",
+                f"{badge('A', ACCENT)} enable all   {badge('N', ACCENT)} clear all   {badge('D', SUCCESS)} done   {badge('Q', WARNING)} exit",
+                "Enter one or more numbers separated by spaces or commas to toggle specific sections.",
+            ],
+            tone=ACCENT,
+            width=min(ui_width(), 108),
+        )
 
-    return ScanProfile(
+        choice = prompt("Custom selection [numbers/A/N/D/Q]").lower().replace(",", " ").split()
+        if not choice:
+            continue
+
+        if choice == ["a"]:
+            enabled = {item.key for item in OPTIONAL_ENRICHMENTS}
+            continue
+        if choice == ["n"]:
+            enabled.clear()
+            continue
+        if choice == ["q"]:
+            sys.exit(0)
+        if choice == ["d"]:
+            break
+
+        changed = False
+        for token in choice:
+            if token.isdigit():
+                index = int(token)
+                if 1 <= index <= len(OPTIONAL_ENRICHMENTS):
+                    key = OPTIONAL_ENRICHMENTS[index - 1].key
+                    if key in enabled:
+                        enabled.remove(key)
+                    else:
+                        enabled.add(key)
+                    changed = True
+        if not changed:
+            print_notice("Enter valid option numbers, A, N, D, or Q.", WARNING)
+
+    profile = ScanProfile(
         key="custom",
-        name="Custom options",
-        description="Manual enrichment selection for this run.",
+        name="Custom",
+        description="Manual expert control over summaries and detail sections.",
+        badge="CUSTOM",
+        purpose="Lets you build a scan view section by section without touching the lookup pipeline.",
         enabled=enabled,
-        prompt_for_details=False,
+        section_order=[item.key for item in OPTIONAL_ENRICHMENTS if item.key in enabled and item.key != "detailed_results"] + (["detailed_results"] if "detailed_results" in enabled else []),
+        overview_metrics=list(SCAN_PROFILES["standard"].overview_metrics),
+        table_mode="standard",
+        detail_mode="all" if "detailed_results" in enabled else "prompt",
+        detail_prompt_default="n",
+        show_high_risk_findings=True,
+        show_failed_lookup_review="failed_lookup_summary" in enabled,
+    )
+    print_scan_profile_summary(profile)
+    return profile
+
+
+def print_profile_catalog(default_choice):
+    header("SCAN PROFILES", "Each profile changes density, section order, and how much intelligence is surfaced.")
+    for index, profile_key in enumerate(PROFILE_MENU_ORDER[:-1], start=1):
+        profile = SCAN_PROFILES[profile_key]
+        note = f"Default for this workflow" if str(index) == default_choice else ""
+        print_option_panel(
+            index=index,
+            title=profile.name,
+            badge_text=profile.badge or "ACTIVE",
+            summary=profile.description,
+            detail=profile.purpose,
+            note=note,
+            tone=SUCCESS if str(index) == default_choice else PRIMARY,
+            width=min(ui_width(), 102),
+        )
+
+    print_option_panel(
+        index=len(PROFILE_MENU_ORDER),
+        title="Custom",
+        badge_text="CUSTOM",
+        summary="Manual expert control over individual sections.",
+        detail="Toggle enrichments directly, then review the final configuration before the scan starts.",
+        tone=ACCENT,
+        width=min(ui_width(), 102),
+    )
+    print_option_panel(
+        index=len(PROFILE_MENU_ORDER) + 1,
+        title="Exit",
+        badge_text="QUIT",
+        summary="Leave the console.",
+        tone=MUTED,
+        width=min(ui_width(), 102),
     )
 
 
 def choose_scan_profile(workflow_preset, show_step=True):
     if show_step:
-        print_step(4, workflow_preset.step_total, "Choose scan profile", "Pick a different scan profile only if you want to override the recommended setup.")
+        print_step(4, workflow_preset.step_total, "Choose scan profile", "Pick the review density that matches how much context you want on screen.")
 
     default_choices = {
         "quick": "1",
         "standard": "2",
-        "deep": "3",
+        "threat_hunter": "3",
+        "analyst": "4",
+        "insanity": "5",
     }
     default_choice = default_choices.get(workflow_preset.default_profile_key, "2")
 
     while True:
-        print_box(
-            "Scan Profiles",
-            [
-                f"{color('1', BOLD + ACCENT)}  Quick scan     Fastest first pass",
-                f"{color('2', BOLD + ACCENT)}  Standard scan  Best default balance",
-                f"{color('3', BOLD + ACCENT)}  Deep scan      All available summaries and details",
-                f"{color('4', BOLD + ACCENT)}  Custom options Choose enrichments manually",
-                f"{color('5', BOLD + ACCENT)}  Exit",
-            ],
-            tone=PRIMARY,
-            width=min(terminal_width(), 84),
-        )
+        print_profile_catalog(default_choice)
 
-        choice = prompt(f"Choose a profile [1-5, Enter={default_choice}]: ")
+        choice = prompt(f"Choose a profile [1-{len(PROFILE_MENU_ORDER) + 1}, Enter={default_choice}]")
         if not choice:
             choice = default_choice
 
@@ -2168,21 +3685,28 @@ def choose_scan_profile(workflow_preset, show_step=True):
             print_scan_profile_summary(profile)
             return profile
         if choice == "3":
-            profile = get_scan_profile("deep")
+            profile = get_scan_profile("threat_hunter")
             print_scan_profile_summary(profile)
             return profile
         if choice == "4":
-            profile = build_custom_scan_profile()
+            profile = get_scan_profile("analyst")
             print_scan_profile_summary(profile)
             return profile
         if choice == "5":
+            profile = get_scan_profile("insanity")
+            print_scan_profile_summary(profile)
+            return profile
+        if choice == "6":
+            profile = build_custom_scan_profile()
+            return profile
+        if choice == "7":
             sys.exit(0)
 
-        print(color("Invalid choice.", WARNING))
+        print_notice("Invalid choice. Enter one of the listed profile numbers.", WARNING)
 
 
 def choose_scan_setup(workflow_preset):
-    print_step(4, workflow_preset.step_total, "Confirm scan setup", "The recommended setup is the easiest path.")
+    print_step(4, workflow_preset.step_total, "Confirm scan setup", "Use the recommended profile unless you want a different review density.")
     recommended_profile = get_recommended_scan_profile(workflow_preset)
     print_recommended_scan_setup(workflow_preset, recommended_profile)
 
@@ -2216,11 +3740,20 @@ def sort_results(results, counts):
 
 
 def render_review_sections(results, counts, invalid_ips, profile):
-    print_result_overview(results, counts)
-    print_results_table(results, counts)
+    print_result_overview(results, counts, profile, invalid_ips=invalid_ips)
+
+    if profile.key == "insanity":
+        header("INSANITY MODE", "All meaningful views are enabled, but grouped into deliberate stages instead of a raw dump.")
+
+    if profile.show_high_risk_findings:
+        print_high_risk_findings(results, counts, profile)
+
+    print_results_table(results, counts, profile)
     render_enabled_enrichments(results, counts, profile)
     render_detailed_results_if_enabled(results, counts, profile)
-    print_invalid(invalid_ips)
+
+    if profile.show_invalid_entries:
+        print_invalid(invalid_ips)
 
 
 def run_lookup_workflow():
@@ -2243,24 +3776,24 @@ def run_lookup_workflow():
     print_step(
         5,
         workflow_preset.step_total,
-        "Run geolocation lookup",
+        "Run live intelligence pipeline",
         (
             f"Using {profile.name} under {workflow_preset.name}. "
             f"Submitting {len(parsed_input.valid_ips)} unique IP"
             f"{'s' if len(parsed_input.valid_ips) != 1 else ''} to the batch API."
         ),
     )
-    raw_results = run_with_spinner("Looking up IPs...", lookup_ips, parsed_input.valid_ips)
+    raw_results = run_with_spinner("Submitting batch geolocation lookups...", lookup_ips, parsed_input.valid_ips)
     results = hydrate_result_records(raw_results, parsed_input.counts)
-    results = run_with_spinner("Resolving reverse DNS...", enrich_records_with_reverse_dns, results)
-    results = run_with_spinner("Checking Tor exit nodes...", enrich_records_with_tor_signal, results)
+    results = run_with_spinner("Resolving reverse DNS context...", enrich_records_with_reverse_dns, results)
+    results = run_with_spinner("Checking Tor exit intelligence...", enrich_records_with_tor_signal, results)
     results = sort_results(results, parsed_input.counts)
 
     print_step(
         6,
         workflow_preset.step_total,
         "Review results and export",
-        "Core results come first, then profile-driven enrichments and exports.",
+        "The console will stage the output according to the selected profile, then offer export options.",
     )
     render_review_sections(results, parsed_input.counts, parsed_input.invalid_ips, profile)
     run_export_flow(results, parsed_input.counts)
@@ -2272,8 +3805,11 @@ def run_lookup_workflow():
 
 
 def main():
+    initialize_runtime_intel()
     enable_windows_terminal()
     show_banner()
+    if INTEL_LOAD_WARNING:
+        print(color(INTEL_LOAD_WARNING, WARNING))
 
     try:
         run_lookup_workflow()
